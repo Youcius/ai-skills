@@ -1,0 +1,2 @@
+Runtime: Node.js
+Command: node <skill_dir>/scripts/x_search_cli.js

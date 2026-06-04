@@ -1,476 +1,497 @@
 #!/usr/bin/env node
-/**
- * X-Search CLI — Node.js (zero-dependency)
- * Commands: search | fetch | map | sources | config | model | doc
- */
-
 'use strict';
 
-const https = require('https');
-const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 const { URL } = require('url');
 
-// ── Paths ──────────────────────────────────────────
 const SKILL_DIR = path.resolve(__dirname, '..');
 const ENV_FILE = path.join(SKILL_DIR, '.env');
-const CONFIG_FILE = path.join(process.env.HOME || process.env.USERPROFILE || '.', '.config', 'x-search', 'config.json');
 const CACHE_DIR = path.join(SKILL_DIR, '.cache');
+const CONFIG_FILE = path.join(process.env.HOME || process.env.USERPROFILE || '.', '.config', 'x-search', 'config.json');
 
-// ── Load .env ──────────────────────────────────────
 function loadEnv() {
   if (!fs.existsSync(ENV_FILE)) return;
-  fs.readFileSync(ENV_FILE, 'utf8')
-    .split(/\r?\n/)
-    .forEach(line => {
-      const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+)/);
-      if (m && !m[1].startsWith('#')) process.env[m[1]] = m[2].trim();
-    });
+  const lines = fs.readFileSync(ENV_FILE, 'utf8').split(/\r?\n/);
+  for (const line of lines) {
+    const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+)\s*$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+  }
 }
+
+function loadConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveConfig(config) {
+  fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+function request(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const lib = u.protocol === 'https:' ? https : http;
+    const req = lib.request(
+      {
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname + u.search,
+        method: options.method || 'GET',
+        headers: options.headers || {},
+        timeout: options.timeout || 30000,
+        rejectUnauthorized: false,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8');
+          if (res.statusCode >= 400) {
+            reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 400)}`));
+            return;
+          }
+          resolve({ status: res.statusCode, data: body, headers: res.headers });
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('timeout'));
+    });
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
+
+function requestJson(url, options = {}) {
+  return request(url, options).then((res) => {
+    try {
+      return JSON.parse(res.data);
+    } catch {
+      throw new Error(`Invalid JSON from ${url}`);
+    }
+  });
+}
+
+function ensureCacheDir() {
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
+
+function cacheSession(sessionId, payload) {
+  ensureCacheDir();
+  fs.writeFileSync(path.join(CACHE_DIR, `${sessionId}.json`), JSON.stringify(payload, null, 2));
+}
+
+function readSession(sessionId) {
+  const file = path.join(CACHE_DIR, `${sessionId}.json`);
+  if (!fs.existsSync(file)) return null;
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
 loadEnv();
 
-// ── Config helpers ─────────────────────────────────
-function loadConfig() {
-  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return {}; }
-}
-function saveConfig(cfg) {
-  fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
-}
-
-// ── Env defaults ───────────────────────────────────
 const GROK_API_URL = process.env.GROK_API_URL || 'https://grok.star21.cc/v1';
 const GROK_API_KEY = process.env.GROK_API_KEY || '';
 const DEFAULT_MODEL = process.env.GROK_MODEL || 'grok-4.20-fast';
 const TAVILY_API_URL = process.env.TAVILY_API_URL || 'https://tavily.star21.cc';
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
 
-// ── HTTP helper ────────────────────────────────────
-function request(url, opts = {}) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const lib = u.protocol === 'https:' ? https : http;
-    const req = lib.request({
-      hostname: u.hostname, port: u.port,
-      path: u.pathname + u.search,
-      method: opts.method || 'GET',
-      headers: opts.headers || {},
-      timeout: opts.timeout || 30000,
-      rejectUnauthorized: false
-    }, res => {
-      const chunks = [];
-      res.on('data', c => chunks.push(c));
-      res.on('end', () => {
-        const body = Buffer.concat(chunks).toString('utf8');
-        if (res.statusCode >= 400) reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 300)}`));
-        else resolve({ status: res.statusCode, data: body, headers: res.headers });
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-    if (opts.body) req.write(opts.body);
-    req.end();
-  });
+function hasGrok() {
+  return Boolean(GROK_API_KEY);
 }
 
-// ── Cache ──────────────────────────────────────────
-function cacheSources(sessionId, sources) {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-  fs.writeFileSync(path.join(CACHE_DIR, `${sessionId}.json`), JSON.stringify({ sources, ts: Date.now() }));
+function hasTavily() {
+  return Boolean(TAVILY_API_KEY);
 }
 
-function getCachedSources(sessionId) {
-  const f = path.join(CACHE_DIR, `${sessionId}.json`);
-  if (!fs.existsSync(f)) return null;
-  return JSON.parse(fs.readFileSync(f, 'utf8'));
+function sanitizeQuery(query) {
+  return String(query || '').replace(/\s+/g, ' ').trim();
 }
 
-// ════════════════════════════════════════════════════
-//  COMMANDS
-// ════════════════════════════════════════════════════
+function shouldPlan(query, mode) {
+  if (mode === 'force') return true;
+  if (mode === 'off') return false;
+  const q = query.toLowerCase();
+  if (query.length > 36) return true;
+  if (/vs\b|compare|comparison|difference|tradeoff|error|issue|best practice|migration/i.test(q)) return true;
+  if (/[对比区别差异怎么解决报错原因迁移方案]/.test(query)) return true;
+  return false;
+}
 
-// ── search ─────────────────────────────────────────
-async function cmdSearch(query, opts) {
-  const model = opts.model || loadConfig().model || DEFAULT_MODEL;
-  const start = Date.now();
-
-  const systemPrompt = [
-    'You are a helpful AI assistant with web search capability.',
-    'Search the web and provide a comprehensive, accurate answer.',
-    'Cite sources with [1], [2] etc. when referencing specific facts.',
-    opts.platform ? `Focus results on ${opts.platform}.` : ''
-  ].filter(Boolean).join(' ');
-
-  const payload = JSON.stringify({
-    model,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: query }
-    ],
-    stream: false
-  });
-
-  const result = await request(`${GROK_API_URL}/chat/completions`, {
+async function grokChat(messages, model) {
+  const data = await requestJson(`${GROK_API_URL}/chat/completions`, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${GROK_API_KEY}`,
-      'Content-Type': 'application/json'
+      Authorization: `Bearer ${GROK_API_KEY}`,
+      'Content-Type': 'application/json',
     },
-    body: payload,
-    timeout: 120000
+    body: JSON.stringify({ model, messages, stream: false }),
+    timeout: 120000,
+  });
+  return data.choices?.[0]?.message?.content || '';
+}
+
+async function planQueries(query, maxQueries, model) {
+  if (!hasGrok()) return [query];
+  try {
+    const text = await grokChat(
+      [
+        {
+          role: 'system',
+          content:
+            'You break a user research query into a few non-overlapping web search queries. Return JSON only: {"queries":["..."]}. Keep each query short and specific. Max ' +
+            maxQueries +
+            ' queries.',
+        },
+        { role: 'user', content: query },
+      ],
+      model
+    );
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) return [query];
+    const parsed = JSON.parse(match[0]);
+    const queries = Array.isArray(parsed.queries) ? parsed.queries.map(sanitizeQuery).filter(Boolean) : [];
+    return queries.slice(0, maxQueries).length ? queries.slice(0, maxQueries) : [query];
+  } catch {
+    return [query];
+  }
+}
+
+async function tavilySearch(query, maxResults) {
+  if (!hasTavily()) throw new Error('TAVILY_API_KEY not set');
+  const data = await requestJson(`${TAVILY_API_URL}/search`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${TAVILY_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      query,
+      max_results: maxResults,
+      search_depth: 'advanced',
+      include_answer: false,
+      include_raw_content: false,
+      topic: 'general',
+    }),
+    timeout: 60000,
+  });
+  return Array.isArray(data.results) ? data.results : [];
+}
+
+function dedupeSources(results) {
+  const seen = new Set();
+  const merged = [];
+  for (const item of results) {
+    const url = item.url || item.link;
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    merged.push({
+      title: item.title || 'Untitled',
+      url,
+      content: String(item.content || item.snippet || '').trim(),
+      score: item.score,
+      query: item.query,
+    });
+  }
+  return merged;
+}
+
+function buildSourceContext(sources) {
+  return sources
+    .map((s, i) => `[${i + 1}] ${s.title}\nURL: ${s.url}\nSnippet: ${s.content || '(none)'}`)
+    .join('\n\n');
+}
+
+async function synthesizeAnswer(originalQuery, queries, sources, model) {
+  if (!hasGrok()) return '';
+  const prompt = [
+    'Answer the user using only the provided sources.',
+    'Use citation markers like [1], [2].',
+    'If the sources are insufficient, say so plainly.',
+    'Prefer concrete dates for time-sensitive information.',
+    '',
+    `User question: ${originalQuery}`,
+    `Search queries used: ${queries.join(' | ')}`,
+    '',
+    'Sources:',
+    buildSourceContext(sources),
+  ].join('\n');
+  return grokChat(
+    [
+      { role: 'system', content: 'You are a concise research assistant.' },
+      { role: 'user', content: prompt },
+    ],
+    model
+  );
+}
+
+function formatSourceList(sources) {
+  if (!sources.length) return '未找到来源';
+  return sources.map((s, i) => `${i + 1}. [${s.title}](${s.url})`).join('\n');
+}
+
+async function cmdSearch(query, options) {
+  const cleanQuery = sanitizeQuery(query);
+  if (!cleanQuery) throw new Error('query is required');
+  if (!hasTavily()) throw new Error('TAVILY_API_KEY not set');
+
+  const config = loadConfig();
+  const model = options.model || config.model || DEFAULT_MODEL;
+  const planMode = options.plan || 'auto';
+  const maxResults = options.max_results || 5;
+  const maxQueries = options.max_queries || 3;
+  const usePlan = shouldPlan(cleanQuery, planMode);
+  const queries = usePlan ? await planQueries(cleanQuery, maxQueries, model) : [cleanQuery];
+
+  const allResults = [];
+  for (const q of queries) {
+    const results = await tavilySearch(q, maxResults);
+    results.forEach((item) => allResults.push({ ...item, query: q }));
+  }
+
+  const sources = dedupeSources(allResults);
+  const answer = await synthesizeAnswer(cleanQuery, queries, sources, model);
+  const sessionId = `xsearch_${Date.now()}`;
+
+  cacheSession(sessionId, {
+    session_id: sessionId,
+    query: cleanQuery,
+    plan_mode: planMode,
+    queries,
+    model,
+    sources,
+    answer,
+    created_at: new Date().toISOString(),
   });
 
-  const data = JSON.parse(result.data);
-  const answer = data.choices?.[0]?.message?.content || '';
-  const usage = data.usage || {};
+  console.log(`## 搜索结果\n`);
+  console.log(`- 查询: ${cleanQuery}`);
+  console.log(`- 模式: ${usePlan ? 'plan' : 'direct'}`);
+  console.log(`- 子查询: ${queries.length}`);
+  console.log(`- 来源: ${sources.length}`);
+  console.log(`- session_id: ${sessionId}\n`);
 
-  // Extra sources via Tavily
-  let sources = [];
-  const extraSources = opts.extra_sources ?? 3;
-  if (extraSources > 0 && TAVILY_API_KEY) {
-    try {
-      const tr = await request(`${TAVILY_API_URL}/search`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${TAVILY_API_KEY}` },
-        body: JSON.stringify({ query, max_results: extraSources, search_depth: 'basic' }),
-        timeout: 30000
-      });
-      sources = JSON.parse(tr.data).results || [];
-    } catch { /* Tavily is best-effort */ }
-  }
-
-  const sessionId = `grok_${Date.now()}`;
-  cacheSources(sessionId, sources);
-
-  const elapsed = Date.now() - start;
-
-  // Output
-  console.log(`## Search Results (${sources.length} sources, ${elapsed}ms)\n`);
-  console.log(answer);
-  if (sources.length > 0) {
-    console.log(`\n---\n### Sources (${sources.length})\n`);
-    sources.forEach((s, i) => console.log(`${i + 1}. [${s.title || 'Untitled'}](${s.url})`));
-  }
-  console.log(`\n<!-- session_id: ${sessionId} | model: ${model} | tokens: ${usage.total_tokens || '?'} -->`);
-}
-
-// ── fetch ──────────────────────────────────────────
-async function cmdFetch(url) {
-  const start = Date.now();
-
-  // Try Grok API first for AI-enhanced extraction
-  let content;
-  try {
-    const result = await request(`${GROK_API_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${GROK_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: DEFAULT_MODEL,
-        messages: [
-          { role: 'system', content: 'Extract the main content from the following URL and return it as clean Markdown. Include the title, headings, key paragraphs, and any code blocks. Strip navigation, ads, and boilerplate.' },
-          { role: 'user', content: `Extract content from: ${url}` }
-        ],
-        stream: false
-      }),
-      timeout: 60000
+  if (answer) {
+    console.log(answer.trim());
+  } else {
+    console.log(`### 来源摘要\n`);
+    sources.slice(0, 8).forEach((s, i) => {
+      console.log(`${i + 1}. ${s.title}`);
+      console.log(`   ${s.url}`);
+      if (s.content) console.log(`   ${s.content.slice(0, 240)}`);
     });
-    content = JSON.parse(result.data).choices?.[0]?.message?.content || '';
-  } catch {
-    // Fallback: direct fetch + basic HTML strip
-    try {
-      const r = await request(url, { timeout: 30000 });
-      content = r.data
-        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/\s{2,}/g, '\n')
-        .trim()
-        .slice(0, 50000);
-    } catch (e2) {
-      console.error(`Fetch failed: ${e2.message}`);
-      process.exit(1);
-    }
   }
 
-  const elapsed = Date.now() - start;
-  console.log(content);
-  console.log(`\n<!-- fetched in ${elapsed}ms -->`);
+  console.log(`\n---\n### 来源\n`);
+  console.log(formatSourceList(sources));
 }
 
-// ── map ────────────────────────────────────────────
-async function cmdMap(url, opts) {
-  const depth = opts.depth ?? 1;
-  const breadth = opts.breadth ?? 20;
-  const limit = opts.limit ?? 50;
-  const instructions = opts.instructions || '';
-  const start = Date.now();
+async function tavilyExtract(url) {
+  const data = await requestJson(`${TAVILY_API_URL}/extract`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${TAVILY_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      urls: [url],
+      extract_depth: 'advanced',
+      format: 'markdown',
+    }),
+    timeout: 60000,
+  });
+  const result = Array.isArray(data.results) ? data.results[0] : null;
+  return result ? (result.raw_content || result.content || '').trim() : '';
+}
 
-  const visited = new Set();
-  const results = [];
+async function fallbackFetch(url) {
+  const response = await request(url, { timeout: 30000 });
+  return response.data
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s{2,}/g, '\n')
+    .trim()
+    .slice(0, 50000);
+}
 
-  async function crawl(u, d) {
-    if (d > depth || visited.size >= limit) return;
-    if (visited.has(u)) return;
-    visited.add(u);
-
+async function cmdFetch(url) {
+  const target = sanitizeQuery(url);
+  if (!target) throw new Error('url is required');
+  let content = '';
+  if (hasTavily()) {
     try {
-      const r = await request(u, { timeout: 15000 });
-      const links = [];
-      const linkRe = /href\s*=\s*["']([^"']+)["']/gi;
-      let m;
-      while ((m = linkRe.exec(r.data)) !== null) {
-        try {
-          const resolved = new URL(m[1], u).href;
-          if (resolved.startsWith('http') && !visited.has(resolved)) links.push(resolved);
-        } catch {}
-      }
-
-      const title = (r.data.match(/<title[^>]*>([^<]+)<\/title>/i) || [])[1] || u;
-      results.push({ url: u, title: title.trim(), links: links.slice(0, breadth) });
-
-      if (d < depth) {
-        const toVisit = links.slice(0, breadth);
-        for (const next of toVisit) await crawl(next, d + 1);
-      }
+      content = await tavilyExtract(target);
     } catch {}
   }
+  if (!content) content = await fallbackFetch(target);
+  console.log(content || '未提取到内容');
+}
 
-  await crawl(url, 0);
-
-  const elapsed = Date.now() - start;
-
-  // Output as Markdown
-  console.log(`## Site Map: ${new URL(url).hostname}\n`);
-  console.log(`Depth: ${depth} | Breadth: ${breadth} | Pages: ${results.length} | Time: ${elapsed}ms\n`);
-  results.forEach((r, i) => {
-    const indent = '  '.repeat(r.url.split('/').length - 3);
-    console.log(`${i + 1}. [${r.title}](${r.url})`);
+async function tavilyMap(url, options) {
+  const data = await requestJson(`${TAVILY_API_URL}/map`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${TAVILY_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      url,
+      max_depth: options.depth || 1,
+      max_breadth: options.breadth || 20,
+      limit: options.limit || 50,
+      format: 'markdown',
+    }),
+    timeout: 60000,
   });
+  if (Array.isArray(data.results)) return data.results;
+  if (Array.isArray(data.links)) return data.links.map((item) => ({ url: item }));
+  return [];
 }
 
-// ── sources ────────────────────────────────────────
-function cmdSources(sessionId) {
-  const cached = getCachedSources(sessionId);
-  if (!cached) {
-    console.error(`No cached sources for session: ${sessionId}`);
-    process.exit(1);
-  }
-  console.log(`## Cached Sources (${cached.sources.length})\n`);
-  cached.sources.forEach((s, i) => {
-    console.log(`${i + 1}. **${s.title || 'Untitled'}**`);
-    console.log(`   ${s.url}`);
-    if (s.content) console.log(`   > ${s.content.slice(0, 200)}...`);
-  });
-}
-
-// ── config ─────────────────────────────────────────
-async function cmdConfig() {
-  const cfg = loadConfig();
-  console.log('## X-Search Configuration\n');
-  console.log(`| Setting | Value |`);
-  console.log(`|---------|-------|`);
-  console.log(`| GROK_API_URL | \`${GROK_API_URL}\` |`);
-  console.log(`| GROK_API_KEY | \`${GROK_API_KEY ? GROK_API_KEY.slice(0, 4) + '***' + GROK_API_KEY.slice(-4) : 'not set'}\` |`);
-  console.log(`| GROK_MODEL (env) | \`${DEFAULT_MODEL}\` |`);
-  console.log(`| GROK_MODEL (config) | \`${cfg.model || 'not set'}\` |`);
-  console.log(`| TAVILY_ENABLED | \`${TAVILY_API_KEY ? 'yes' : 'no'}\` |`);
-
-  // Connection test
-  console.log(`\n### Connection Test`);
-  try {
-    const start = Date.now();
-    await request(`${GROK_API_URL}/models`, {
-      headers: { 'Authorization': `Bearer ${GROK_API_KEY}` },
-      timeout: 10000
-    });
-    const ms = Date.now() - start;
-    console.log(`✅ Connected (${ms}ms)`);
-  } catch (e) {
-    console.log(`❌ Failed: ${e.message}`);
-  }
-}
-
-// ── model ──────────────────────────────────────────
-async function cmdModel(modelName) {
-  if (!modelName) {
-    // List available models
-    try {
-      const r = await request(`${GROK_API_URL}/models`, {
-        headers: { 'Authorization': `Bearer ${GROK_API_KEY}` },
-        timeout: 10000
-      });
-      const data = JSON.parse(r.data);
-      console.log('## Available Models\n');
-      (data.data || data.models || []).forEach(m => console.log(`- \`${m.id || m}\``));
-    } catch (e) {
-      console.error(`Failed to list models: ${e.message}`);
-    }
+async function cmdMap(url, options) {
+  if (!hasTavily()) throw new Error('TAVILY_API_KEY not set');
+  const results = await tavilyMap(url, options);
+  console.log(`## Site Map\n`);
+  if (!results.length) {
+    console.log('未找到页面');
     return;
   }
-
-  const cfg = loadConfig();
-  cfg.model = modelName;
-  saveConfig(cfg);
-  console.log(`✅ Model switched to: \`${modelName}\``);
+  results.forEach((item, index) => {
+    const title = item.title || item.url || `Page ${index + 1}`;
+    const link = item.url || item;
+    console.log(`${index + 1}. [${title}](${link})`);
+  });
 }
 
-// ── doc ────────────────────────────────────────────
+function cmdSources(sessionId) {
+  const cached = readSession(sessionId);
+  if (!cached) throw new Error(`session not found: ${sessionId}`);
+  console.log(`## Sources for ${sessionId}\n`);
+  console.log(`Query: ${cached.query}\n`);
+  console.log(formatSourceList(cached.sources || []));
+}
+
+async function cmdConfig() {
+  const config = loadConfig();
+  console.log('## X-Search Config\n');
+  console.log(`- GROK_API_URL: ${GROK_API_URL}`);
+  console.log(`- GROK_API_KEY: ${hasGrok() ? `${GROK_API_KEY.slice(0, 4)}***${GROK_API_KEY.slice(-4)}` : 'not set'}`);
+  console.log(`- GROK_MODEL: ${config.model || DEFAULT_MODEL}`);
+  console.log(`- TAVILY_API_URL: ${TAVILY_API_URL}`);
+  console.log(`- TAVILY_API_KEY: ${hasTavily() ? `${TAVILY_API_KEY.slice(0, 4)}***${TAVILY_API_KEY.slice(-4)}` : 'not set'}`);
+
+  console.log('\n### Connectivity');
+  try {
+    if (hasTavily()) {
+      await requestJson(`${TAVILY_API_URL}/search`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${TAVILY_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query: 'hello world', max_results: 1, search_depth: 'basic' }),
+        timeout: 15000,
+      });
+      console.log('- Tavily: ok');
+    } else {
+      console.log('- Tavily: skipped');
+    }
+  } catch (error) {
+    console.log(`- Tavily: failed (${error.message})`);
+  }
+
+  try {
+    if (hasGrok()) {
+      await requestJson(`${GROK_API_URL}/models`, {
+        headers: { Authorization: `Bearer ${GROK_API_KEY}` },
+        timeout: 15000,
+      });
+      console.log('- Grok: ok');
+    } else {
+      console.log('- Grok: skipped');
+    }
+  } catch (error) {
+    console.log(`- Grok: failed (${error.message})`);
+  }
+}
+
+async function cmdModel(name) {
+  if (!name) {
+    const config = loadConfig();
+    console.log(config.model || DEFAULT_MODEL);
+    return;
+  }
+  const config = loadConfig();
+  config.model = name;
+  saveConfig(config);
+  console.log(`model = ${name}`);
+}
+
 function cmdDoc() {
-  const doc = `
-## X-Search CLI — Interface Specification
+  console.log(`
+## x-search
 
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| \`search <query>\` | AI-powered web search via Grok model |
-| \`fetch <url>\` | Extract page content as Markdown |
-| \`map <url>\` | Crawl site structure (graph map) |
-| \`sources <id>\` | Retrieve cached sources by session_id |
-| \`config\` | Show config + test API connectivity |
-| \`model [name]\` | List or switch active model |
-| \`doc\` | Show this documentation |
-
-### search — AI-powered web search
-
-\`\`\`bash
-node x_search_cli.js search "quantum computing breakthroughs 2025"
-node x_search_cli.js search "react 19 new features" --platform GitHub --extra_sources 5
-\`\`\`
-
-Options:
-  --platform, -p     Target platform (GitHub, Twitter, Reddit…)
-  --model, -m        Override model for this request
-  --extra_sources, -e  Extra Tavily results (0-10, default 3)
-
-Returns: Markdown with answer + source list + session metadata.
-
-### fetch — Extract page content
-
-\`\`\`bash
-node x_search_cli.js fetch "https://example.com/docs"
-\`\`\`
-
-Returns: Page content as Markdown (max 50K chars).
-
-### map — Site structure crawl
-
-\`\`\`bash
-node x_search_cli.js map "https://docs.example.com" --depth 2 --breadth 15 --limit 60
-\`\`\`
-
-Options:
-  --depth, -d        Max crawl depth (default 1)
-  --breadth, -b      Max links per page (default 20)
-  --limit, -l        Max total pages (default 50)
-  --instructions, -i Natural-language filter (e.g. "only API docs")
-
-### sources — Get cached sources
-
-\`\`\`bash
-node x_search_cli.js sources grok_1717000000000
-\`\`\`
-
-### config — Configuration & connection test
-
-\`\`\`bash
-node x_search_cli.js config
-\`\`\`
-
-Shows current settings, API key status, and runs a connection test.
-
-### model — Model management
-
-\`\`\`bash
-node x_search_cli.js model              # List available models
-node x_search_cli.js model grok-4-fast  # Switch model
-\`\`\`
-
-### Anonymous / Key-less usage
-
-The CLI works without an API key but with lower limits.
-To configure: create \`.env\` in the skill directory:
-
-\`\`\`
-GROK_API_KEY=your_key_here
-GROK_MODEL=grok-4.20-fast
-\`\`\`
-
-Key priority: \`--model\` flag > \`.config/x-search/config.json\` > \`.env\` > environment variable.
-`;
-
-  console.log(doc.trim());
+Commands:
+  search <query> [--plan off|auto|force] [--max_results N] [--max_queries N] [--model MODEL]
+  fetch <url>
+  map <url> [--depth N] [--breadth N] [--limit N]
+  sources <session_id>
+  config
+  model [name]
+  doc
+`.trim());
 }
-
-// ════════════════════════════════════════════════════
-//  MAIN
-// ════════════════════════════════════════════════════
 
 function parseArgs(argv) {
   const command = argv[0];
-  const opts = { _args: [] };
-
-  for (let i = 1; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === '--platform' || a === '-p') opts.platform = argv[++i];
-    else if (a === '--model' || a === '-m') opts.model = argv[++i];
-    else if (a === '--extra_sources' || a === '-e') opts.extra_sources = parseInt(argv[++i]);
-    else if (a === '--depth' || a === '-d') opts.depth = parseInt(argv[++i]);
-    else if (a === '--breadth' || a === '-b') opts.breadth = parseInt(argv[++i]);
-    else if (a === '--limit' || a === '-l') opts.limit = parseInt(argv[++i]);
-    else if (a === '--instructions' || a === '-i') opts.instructions = argv[++i];
-    else if (a === '--help' || a === '-h') { command === 'help' ? null : opts._help = true; }
-    else opts._args.push(a);
+  const options = { _args: [] };
+  for (let i = 1; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--plan') options.plan = argv[++i];
+    else if (arg === '--max_results') options.max_results = Number(argv[++i]);
+    else if (arg === '--max_queries') options.max_queries = Number(argv[++i]);
+    else if (arg === '--model' || arg === '-m') options.model = argv[++i];
+    else if (arg === '--depth' || arg === '-d') options.depth = Number(argv[++i]);
+    else if (arg === '--breadth' || arg === '-b') options.breadth = Number(argv[++i]);
+    else if (arg === '--limit' || arg === '-l') options.limit = Number(argv[++i]);
+    else if (arg === '--help' || arg === '-h') options.help = true;
+    else options._args.push(arg);
   }
-  return [command, opts];
+  return [command, options];
 }
 
 (async () => {
-  const args = process.argv.slice(2);
-  if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
-    return cmdDoc();
+  const argv = process.argv.slice(2);
+  if (!argv.length) {
+    cmdDoc();
+    return;
   }
 
-  const [command, opts] = parseArgs(args);
-  if (opts._help) return cmdDoc();
+  const [command, options] = parseArgs(argv);
+  if (options.help || command === 'doc') {
+    cmdDoc();
+    return;
+  }
 
   try {
-    switch (command) {
-      case 'search':
-        if (opts._args.length === 0) { console.error('Usage: x_search_cli.js search <query>'); process.exit(1); }
-        await cmdSearch(opts._args.join(' '), opts);
-        break;
-      case 'fetch':
-        if (opts._args.length === 0) { console.error('Usage: x_search_cli.js fetch <url>'); process.exit(1); }
-        await cmdFetch(opts._args[0]);
-        break;
-      case 'map':
-        if (opts._args.length === 0) { console.error('Usage: x_search_cli.js map <url>'); process.exit(1); }
-        await cmdMap(opts._args[0], opts);
-        break;
-      case 'sources':
-        if (opts._args.length === 0) { console.error('Usage: x_search_cli.js sources <session_id>'); process.exit(1); }
-        cmdSources(opts._args[0]);
-        break;
-      case 'config':
-        await cmdConfig();
-        break;
-      case 'model':
-        await cmdModel(opts._args[0]);
-        break;
-      case 'doc':
-        cmdDoc();
-        break;
-      default:
-        console.error(`Unknown command: ${command}\nRun 'x_search_cli.js doc' for help.`);
-        process.exit(1);
-    }
-  } catch (e) {
-    console.error(`Error: ${e.message}`);
+    if (command === 'search') await cmdSearch(options._args.join(' '), options);
+    else if (command === 'fetch') await cmdFetch(options._args[0]);
+    else if (command === 'map') await cmdMap(options._args[0], options);
+    else if (command === 'sources') cmdSources(options._args[0]);
+    else if (command === 'config') await cmdConfig();
+    else if (command === 'model') await cmdModel(options._args[0]);
+    else throw new Error(`unknown command: ${command}`);
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
     process.exit(1);
   }
 })();

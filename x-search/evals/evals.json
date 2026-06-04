@@ -1,0 +1,29 @@
+{
+  "skill_name": "x-search",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "查一下 OpenAI Responses API 官方文档，并给我来源。",
+      "expected_output": "调用 search，返回官方文档相关结论，并列出来源链接。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "帮我对比 React 19 和 Vue 3.5 的最新进展。",
+      "expected_output": "调用 search 的计划模式，拆成多个子查询后汇总对比结果，并给出来源。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "读一下这个页面正文：https://developers.openai.com/api/docs",
+      "expected_output": "调用 fetch，返回页面正文或可读摘要，不应只返回搜索摘要。",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "看看 https://developers.openai.com/api 这个站大概有哪些页面。",
+      "expected_output": "调用 map，返回站点结构列表或链接列表。",
+      "files": []
+    }
+  ]
+}

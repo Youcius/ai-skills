@@ -6,7 +6,7 @@ Personal collection of AI agent skills — reusable procedures, CLI tools, and w
 
 | Skill | Description | Runtime |
 |-------|-------------|---------|
-| [X-Search](./x-search/) | AI-powered deep search via Grok with 6-phase planning workflow | Node.js |
+| [X-Search](./x-search/) | Lightweight real-time search skill with search, fetch, map, and source-aware synthesis | Node.js |
 
 ## Install
 
@@ -17,8 +17,9 @@ Each skill follows the standard [skill directory structure](https://github.com/a
 cp -r x-search ~/.agents/skills/x-search
 cd ~/.agents/skills/x-search
 cp .env.example .env   # edit with your API keys
+cp runtime.conf.example runtime.conf
 ```
 
 ## Usage
 
-Skills are auto-discovered by AI agents. The agent reads `SKILL.md` for instructions and uses `runtime.conf` (generated on first run) for the configured CLI path.
+Skills are auto-discovered by AI agents. The agent reads `SKILL.md` for instructions and uses `runtime.conf` for the configured CLI path.

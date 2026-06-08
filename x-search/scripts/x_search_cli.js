@@ -235,7 +235,7 @@ async function cmdConfig() {
 
   console.log(`\n### Context7`);
   console.log(`- URL: ${process.env.CONTEXT7_API_URL || 'https://context7.com/api'}`);
-  console.log(`- Key: ${process.env.CONTEXT7_API_KEY ? '✅ configured' : 'ℹ️  public API (key optional)'}`);
+  console.log(`- Key: ${process.env.CONTEXT7_API_KEY ? '✅ configured' : 'ℹ️  optional (higher rate limits with API key)'}`);
 
   // Test connectivity
   console.log('\n### Connectivity');

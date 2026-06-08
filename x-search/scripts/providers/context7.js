@@ -4,10 +4,18 @@ const { requestJson } = require('../utils/fetch');
 
 // Context7 API base (no trailing slash)
 const CONTEXT7_API_URL = (process.env.CONTEXT7_API_URL || 'https://context7.com/api/v2').replace(/\/+$/, '');
+const CONTEXT7_API_KEY = process.env.CONTEXT7_API_KEY || '';
 
 function hasContext7() {
   // Context7 public API doesn't require a key for basic usage
   return true;
+}
+
+/** Build Authorization headers if key is configured */
+function _headers() {
+  return CONTEXT7_API_KEY
+    ? { Authorization: 'Bearer ' + CONTEXT7_API_KEY }
+    : {};
 }
 
 /**
@@ -17,7 +25,7 @@ async function searchLibraries(query, libraryName) {
   try {
     const data = await requestJson(
       `${CONTEXT7_API_URL}/libs/search?libraryName=${encodeURIComponent(libraryName)}&query=${encodeURIComponent(query)}&fast=true`,
-      { timeout: 15000 }
+      { timeout: 15000, headers: _headers() }
     );
     return Array.isArray(data.results) ? data.results : [];
   } catch {
@@ -32,7 +40,7 @@ async function searchLibraries(query, libraryName) {
 async function getDocs(query, libraryId) {
   try {
     const url = `${CONTEXT7_API_URL}/context?query=${encodeURIComponent(query)}&libraryId=${encodeURIComponent(libraryId)}&type=json`;
-    const data = await requestJson(url, { timeout: 15000 });
+    const data = await requestJson(url, { timeout: 15000, headers: _headers() });
     const snippets = [];
     if (Array.isArray(data.codeSnippets)) {
       data.codeSnippets.forEach(function(s) {
@@ -98,4 +106,8 @@ function formatDocsResult(result) {
   return lines.join('\n');
 }
 
-module.exports = { hasContext7, searchLibraries, getDocs, searchDocs, formatDocsResult };
+function hasContext7Key() {
+  return !!CONTEXT7_API_KEY;
+}
+
+module.exports = { hasContext7, hasContext7Key, searchLibraries, getDocs, searchDocs, formatDocsResult };

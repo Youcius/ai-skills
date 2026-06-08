@@ -8,7 +8,7 @@
 |:---|:---|:---:|
 | **Grok Search** | Grok API 调用（中转端点内置联网搜索，无需显式传 tools 参数）。不用 `web_search` 工具。 | 1 (主力) |
 | **Tavily Search** | 通过 Tavily API 实现的通用搜索。Grok 失败时的兜底。 | 2 (兜底) |
-| **Context7** | 通过 Context7 API 实现的库/框架文档搜索。由 Grok 识别用户是否在问库相关问题时，按需调用。 | 按需 |
+| **Context7** | 通过 Context7 API 实现的库/框架文档搜索。由 Grok 识别用户是否在问库相关问题时，按需调用。支持可选 API Key 提频。 | 按需 |
 
 ### API Key 场景
 

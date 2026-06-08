@@ -1,33 +1,59 @@
 ---
 name: x-search
-description: 轻量实时搜索 skill。适合查最新信息、版本变化、报错方案、官方文档、对比分析、单页抓取、站点结构浏览。用户一旦提到“搜一下 / 查一下 / 最新 / 官方文档 / 报错怎么解决 / 对比一下 / 看这个网页内容 / 看这个站有哪些页面”，就该优先用它。
-version: 2.0.0
+description: 轻量实时搜索 skill。适合查最新信息、版本变化、报错方案、官方文档、对比分析、单页抓取、站点结构浏览。用户一旦提到"搜一下 / 查一下 / 最新 / 官方文档 / 报错怎么解决 / 对比一下 / 看这个网页内容 / 看这个站有哪些页面"，就该优先用它。
+version: 3.0.0
 authors:
   - Youcius
 credentials:
   - name: GROK_API_KEY
     required: false
-    description: 用于答案整合。未配置时会退化为仅返回搜索结果摘要。
+    description: Grok API Key。未配置时会退化为 Tavily 搜索。
     storage: ".env file or environment variable"
   - name: TAVILY_API_KEY
-    required: true
-    description: 用于实时搜索、抽取页面、站点 map。
+    required: false
+    description: Tavily API Key。Grok 不可用时的兜底搜索。
     storage: ".env file or environment variable"
 ---
 
 ## 概览
 
-`x-search` 是一个轻量版搜索 skill：
+`x-search` 是一个轻量版搜索 skill，支持多搜索提供商自动切换：
 
-- **不用 MCP 常驻进程**
-- **按需运行**
-- **尽量保留 MCP 的效果**
-  - 简单问题直接搜
-  - 复杂问题自动拆子问题
-  - 汇总多来源
-  - 支持 `search / fetch / map / sources / config`
+- **Grok** — 主力搜索（端点已内置联网能力）
+- **Tavily** — 兜底搜索（Grok 不可用时自动切换）
+- **Context7** — 按需库文档查询（Grok 识别到库/框架问题时自动调用）
+- 不用 MCP 常驻进程
+- 按需运行
+- 支持 `search / fetch / map / sources / config / docs`
 
-推荐直接调用 `runtime.conf` 里的命令。不要每次先读全文档。
+## 架构
+
+```
+scripts/
+├── x_search_cli.js         # 入口 + CLI 路由
+├── providers/
+│   ├── grok.js             # Grok 搜索（主力）
+│   ├── tavily.js           # Tavily 搜索（兜底）
+│   └── context7.js         # Context7 文档搜索（按需）
+└── utils/
+    ├── fetch.js            # HTTP 请求工具
+    ├── cache.js            # 会话缓存
+    └── format.js           # 统一输出格式
+```
+
+### 处理流程
+
+```
+用户输入
+    │
+    ▼
+① Grok 搜索（内置联网）
+   ├─ 成功 → 统一格式输出（结论 + 要点 + 来源）
+   │        同时检测是否涉及库 → 调 Context7 补充文档
+   │
+   └─ 失败/无 Key → Tavily 兜底
+       └─ Grok 规划子查询 → Tavily 搜索 → Grok 汇总
+```
 
 ## 触发
 
@@ -39,10 +65,9 @@ credentials:
 4. 做**对比**、分析、调研
 5. 用户给了一个 URL，要你**读页面正文**
 6. 用户要看某个 docs / 官网的**站点结构**
+7. 用户问具体某个库/框架（自动调 Context7 补充文档）
 
 ## 入口
-
-优先用：
 
 ```bash
 <cmd> search "query"
@@ -63,32 +88,21 @@ node <skill_dir>/scripts/x_search_cli.js
 
 ### 1. `search`
 
-默认命令。适合：
-
-- 查最新
-- 查官方文档
-- 查报错
-- 查对比
-- 查调研结论
-
-常用写法：
+默认命令。优先走 Grok（内置联网），失败自动切 Tavily。
 
 ```bash
 <cmd> search "Next.js 15 cache changes"
 <cmd> search "React 19 和 Vue 3.5 对比" --plan auto
 <cmd> search "pnpm Error: xxx" --plan force
-<cmd> search "OpenAI Responses API tools" --max_results 8
+<cmd> search "OpenAI Responses API" --max_results 8
 ```
 
 参数：
 
-- `--plan off|auto|force`
-  - `off`：直接搜
-  - `auto`：自动判断
-  - `force`：先拆子问题再搜
-- `--max_results N`
-- `--max_queries N`
-- `--model MODEL`
+- `--plan off|auto|force`：是否拆子问题（仅 Tavily 兜底时有效）
+- `--max_results N`：每子查询最大结果数
+- `--max_queries N`：最大子查询数
+- `--model MODEL`：指定 Grok 模型
 
 ### 2. `fetch`
 
@@ -108,6 +122,8 @@ node <skill_dir>/scripts/x_search_cli.js
 <cmd> map "https://docs.example.com" --depth 2 --limit 30
 ```
 
+需要 Tavily API Key。
+
 ### 4. `sources`
 
 查看上一次搜索缓存下来的来源：
@@ -118,62 +134,35 @@ node <skill_dir>/scripts/x_search_cli.js
 
 ### 5. `config`
 
-检查配置、连通性、当前模型。
+检查配置、连通性、当前模型。会测试所有配置的提供商是否可用。
 
-## 搜索规则
+```bash
+<cmd> config
+```
 
-### 简单问题
+### 6. `model`
 
-直接搜 1 次：
+查看或切换模型：
 
-- “React 19 什么时候发布的”
-- “OpenAI Responses API 官方文档”
+```bash
+<cmd> model          # 显示当前模型
+<cmd> model grok-4  # 切换模型
+```
 
-### 中等问题
+## 配置
 
-拆成 2~3 个子问题再汇总：
+配置详见 `.env.example` 文件。
 
-- “React 19 和 Vue 3.5 的近况对比”
-- “这个报错现在主流解决方案是什么”
+## 输出格式
 
-### 复杂问题
+统一输出：**结论 → 要点 → 来源**
 
-先拆问题，再按需补 `fetch` 或 `map`：
-
-- “对比 A 和 B 在 2026 年的能力、生态、迁移成本”
-- “读完这个 docs 站后总结接入方案”
-
-## 输出要求
-
-默认按这个顺序组织：
-
-1. **结论**
-2. **要点**
-3. **来源**
-
-如果是时效信息，要尽量带**具体日期**。  
-如果来源不足、答案不稳，要直接说。
+如果涉及库文档，会在末尾追加 `📚 库文档参考` 区块。
 
 ## 回退规则
 
-- Tavily 不通：明确告诉用户实时搜索不可用
-- Grok 不通：继续返回搜索结果和来源，但不做 AI 汇总
-- `fetch` 失败：退回普通网页抓取
-- `map` 失败：提示站点结构获取失败
-
-## 仓库分发
-
-这个 skill 适合放在：
-
-```text
-ai-skills/
-└─ x-search/
-```
-
-用户下载后，把整个 `x-search` 目录复制到：
-
-```text
-~/.agents/skills/x-search
-```
-
-即可使用。
+- **Grok 失败** → 自动切 Tavily，Grok 仍用于规划子查询和汇总答案
+- **Tavily 失败** → 提示错误
+- **Context7 失败** → 静默忽略（不影响主搜索结果）
+- **fetch 失败** → 退回普通网页抓取
+- **map 失败** → 提示站点结构获取失败

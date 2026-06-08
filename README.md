@@ -1,25 +1,22 @@
-# AI Skills Collection
+# AI Skills
 
-Personal collection of AI agent skills — reusable procedures, CLI tools, and workflows for coding agents (Claude Code, Cursor, OpenCode, Codex, etc.).
+个人 AI agent 技能合集，适用于 Claude Code、Cursor、Codex、Pi 等编码 agent。
 
-## Skills
+## 技能列表
 
-| Skill | Description | Runtime |
-|-------|-------------|---------|
-| [X-Search](./x-search/) | Lightweight real-time search skill with search, fetch, map, and source-aware synthesis | Node.js |
+| 技能 | 说明 | 运行环境 |
+|:---|:---|:---:|
+| [x-search](./x-search/) | 轻量实时搜索，支持 Grok → Tavily → Context7 多提供商自动切换 | Node.js |
 
-## Install
-
-Each skill follows the standard [skill directory structure](https://github.com/anysearch-ai/anysearch-skill). After cloning:
+## 安装
 
 ```bash
-# Example: install x-search
+# 以 x-search 为例
 cp -r x-search ~/.agents/skills/x-search
 cd ~/.agents/skills/x-search
-cp .env.example .env   # edit with your API keys
-cp runtime.conf.example runtime.conf
+cp .env.example .env   # 编辑配置
 ```
 
-## Usage
+## 使用
 
-Skills are auto-discovered by AI agents. The agent reads `SKILL.md` for instructions and uses `runtime.conf` for the configured CLI path.
+agent 会自动发现技能，读取 `SKILL.md` 获取使用说明。

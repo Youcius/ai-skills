@@ -3,23 +3,44 @@
 
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
-const http = require('http');
-const { URL } = require('url');
 
+// ── Load .env BEFORE any provider modules ──
 const SKILL_DIR = path.resolve(__dirname, '..');
-const ENV_FILE = path.join(SKILL_DIR, '.env');
-const CACHE_DIR = path.join(SKILL_DIR, '.cache');
-const CONFIG_FILE = path.join(process.env.HOME || process.env.USERPROFILE || '.', '.config', 'x-search', 'config.json');
-
+const ENV_CANDIDATES = [
+  path.join(SKILL_DIR, '.env'),
+  path.join(process.env.HOME || process.env.USERPROFILE || '', '.agents', 'skills', 'x-search', '.env'),
+];
 function loadEnv() {
-  if (!fs.existsSync(ENV_FILE)) return;
-  const lines = fs.readFileSync(ENV_FILE, 'utf8').split(/\r?\n/);
-  for (const line of lines) {
-    const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+)\s*$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+  for (const envFile of ENV_CANDIDATES) {
+    if (fs.existsSync(envFile)) {
+      const lines = fs.readFileSync(envFile, 'utf8').split(/\r?\n/);
+      for (const line of lines) {
+        const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+)\s*$/);
+        if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+      }
+      break;
+    }
   }
 }
+loadEnv();
+
+// ── Utils (no env dependency) ──
+const { request } = require('./utils/fetch');
+const { ensureCacheDir, cacheSession, readSession } = require('./utils/cache');
+const { dedupeSources, printUnifiedResult } = require('./utils/format');
+
+// ── Providers (need env loaded first) ──
+const grok = require('./providers/grok');
+const tavily = require('./providers/tavily');
+const context7 = require('./providers/context7');
+
+// ── Config ──
+const CONFIG_FILE = path.join(
+  process.env.HOME || process.env.USERPROFILE || '.',
+  '.config',
+  'x-search',
+  'config.json'
+);
 
 function loadConfig() {
   try {
@@ -34,284 +55,14 @@ function saveConfig(config) {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
-function request(url, options = {}) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const lib = u.protocol === 'https:' ? https : http;
-    const req = lib.request(
-      {
-        hostname: u.hostname,
-        port: u.port,
-        path: u.pathname + u.search,
-        method: options.method || 'GET',
-        headers: options.headers || {},
-        timeout: options.timeout || 30000,
-        rejectUnauthorized: false,
-      },
-      (res) => {
-        const chunks = [];
-        res.on('data', (chunk) => chunks.push(chunk));
-        res.on('end', () => {
-          const body = Buffer.concat(chunks).toString('utf8');
-          if (res.statusCode >= 400) {
-            reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 400)}`));
-            return;
-          }
-          resolve({ status: res.statusCode, data: body, headers: res.headers });
-        });
-      }
-    );
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('timeout'));
-    });
-    if (options.body) req.write(options.body);
-    req.end();
-  });
-}
-
-function requestJson(url, options = {}) {
-  return request(url, options).then((res) => {
-    try {
-      return JSON.parse(res.data);
-    } catch {
-      throw new Error(`Invalid JSON from ${url}`);
-    }
-  });
-}
-
-function ensureCacheDir() {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-}
-
-function cacheSession(sessionId, payload) {
-  ensureCacheDir();
-  fs.writeFileSync(path.join(CACHE_DIR, `${sessionId}.json`), JSON.stringify(payload, null, 2));
-}
-
-function readSession(sessionId) {
-  const file = path.join(CACHE_DIR, `${sessionId}.json`);
-  if (!fs.existsSync(file)) return null;
-  return JSON.parse(fs.readFileSync(file, 'utf8'));
-}
-
 loadEnv();
 
-const GROK_API_URL = process.env.GROK_API_URL || 'https://grok.star21.cc/v1';
-const GROK_API_KEY = process.env.GROK_API_KEY || '';
-const DEFAULT_MODEL = process.env.GROK_MODEL || 'grok-4.20-fast';
-const TAVILY_API_URL = process.env.TAVILY_API_URL || 'https://tavily.star21.cc';
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
-
-function hasGrok() {
-  return Boolean(GROK_API_KEY);
-}
-
-function hasTavily() {
-  return Boolean(TAVILY_API_KEY);
-}
-
+// ── Sanitize ──
 function sanitizeQuery(query) {
   return String(query || '').replace(/\s+/g, ' ').trim();
 }
 
-function shouldPlan(query, mode) {
-  if (mode === 'force') return true;
-  if (mode === 'off') return false;
-  const q = query.toLowerCase();
-  if (query.length > 36) return true;
-  if (/vs\b|compare|comparison|difference|tradeoff|error|issue|best practice|migration/i.test(q)) return true;
-  if (/[对比区别差异怎么解决报错原因迁移方案]/.test(query)) return true;
-  return false;
-}
-
-async function grokChat(messages, model) {
-  const data = await requestJson(`${GROK_API_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${GROK_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ model, messages, stream: false }),
-    timeout: 120000,
-  });
-  return data.choices?.[0]?.message?.content || '';
-}
-
-async function planQueries(query, maxQueries, model) {
-  if (!hasGrok()) return [query];
-  try {
-    const text = await grokChat(
-      [
-        {
-          role: 'system',
-          content:
-            'You break a user research query into a few non-overlapping web search queries. Return JSON only: {"queries":["..."]}. Keep each query short and specific. Max ' +
-            maxQueries +
-            ' queries.',
-        },
-        { role: 'user', content: query },
-      ],
-      model
-    );
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return [query];
-    const parsed = JSON.parse(match[0]);
-    const queries = Array.isArray(parsed.queries) ? parsed.queries.map(sanitizeQuery).filter(Boolean) : [];
-    return queries.slice(0, maxQueries).length ? queries.slice(0, maxQueries) : [query];
-  } catch {
-    return [query];
-  }
-}
-
-async function tavilySearch(query, maxResults) {
-  if (!hasTavily()) throw new Error('TAVILY_API_KEY not set');
-  const data = await requestJson(`${TAVILY_API_URL}/search`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${TAVILY_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      query,
-      max_results: maxResults,
-      search_depth: 'advanced',
-      include_answer: false,
-      include_raw_content: false,
-      topic: 'general',
-    }),
-    timeout: 60000,
-  });
-  return Array.isArray(data.results) ? data.results : [];
-}
-
-function dedupeSources(results) {
-  const seen = new Set();
-  const merged = [];
-  for (const item of results) {
-    const url = item.url || item.link;
-    if (!url || seen.has(url)) continue;
-    seen.add(url);
-    merged.push({
-      title: item.title || 'Untitled',
-      url,
-      content: String(item.content || item.snippet || '').trim(),
-      score: item.score,
-      query: item.query,
-    });
-  }
-  return merged;
-}
-
-function buildSourceContext(sources) {
-  return sources
-    .map((s, i) => `[${i + 1}] ${s.title}\nURL: ${s.url}\nSnippet: ${s.content || '(none)'}`)
-    .join('\n\n');
-}
-
-async function synthesizeAnswer(originalQuery, queries, sources, model) {
-  if (!hasGrok()) return '';
-  const prompt = [
-    'Answer the user using only the provided sources.',
-    'Use citation markers like [1], [2].',
-    'If the sources are insufficient, say so plainly.',
-    'Prefer concrete dates for time-sensitive information.',
-    '',
-    `User question: ${originalQuery}`,
-    `Search queries used: ${queries.join(' | ')}`,
-    '',
-    'Sources:',
-    buildSourceContext(sources),
-  ].join('\n');
-  return grokChat(
-    [
-      { role: 'system', content: 'You are a concise research assistant.' },
-      { role: 'user', content: prompt },
-    ],
-    model
-  );
-}
-
-function formatSourceList(sources) {
-  if (!sources.length) return '未找到来源';
-  return sources.map((s, i) => `${i + 1}. [${s.title}](${s.url})`).join('\n');
-}
-
-async function cmdSearch(query, options) {
-  const cleanQuery = sanitizeQuery(query);
-  if (!cleanQuery) throw new Error('query is required');
-  if (!hasTavily()) throw new Error('TAVILY_API_KEY not set');
-
-  const config = loadConfig();
-  const model = options.model || config.model || DEFAULT_MODEL;
-  const planMode = options.plan || 'auto';
-  const maxResults = options.max_results || 5;
-  const maxQueries = options.max_queries || 3;
-  const usePlan = shouldPlan(cleanQuery, planMode);
-  const queries = usePlan ? await planQueries(cleanQuery, maxQueries, model) : [cleanQuery];
-
-  const allResults = [];
-  for (const q of queries) {
-    const results = await tavilySearch(q, maxResults);
-    results.forEach((item) => allResults.push({ ...item, query: q }));
-  }
-
-  const sources = dedupeSources(allResults);
-  const answer = await synthesizeAnswer(cleanQuery, queries, sources, model);
-  const sessionId = `xsearch_${Date.now()}`;
-
-  cacheSession(sessionId, {
-    session_id: sessionId,
-    query: cleanQuery,
-    plan_mode: planMode,
-    queries,
-    model,
-    sources,
-    answer,
-    created_at: new Date().toISOString(),
-  });
-
-  console.log(`## 搜索结果\n`);
-  console.log(`- 查询: ${cleanQuery}`);
-  console.log(`- 模式: ${usePlan ? 'plan' : 'direct'}`);
-  console.log(`- 子查询: ${queries.length}`);
-  console.log(`- 来源: ${sources.length}`);
-  console.log(`- session_id: ${sessionId}\n`);
-
-  if (answer) {
-    console.log(answer.trim());
-  } else {
-    console.log(`### 来源摘要\n`);
-    sources.slice(0, 8).forEach((s, i) => {
-      console.log(`${i + 1}. ${s.title}`);
-      console.log(`   ${s.url}`);
-      if (s.content) console.log(`   ${s.content.slice(0, 240)}`);
-    });
-  }
-
-  console.log(`\n---\n### 来源\n`);
-  console.log(formatSourceList(sources));
-}
-
-async function tavilyExtract(url) {
-  const data = await requestJson(`${TAVILY_API_URL}/extract`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${TAVILY_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      urls: [url],
-      extract_depth: 'advanced',
-      format: 'markdown',
-    }),
-    timeout: 60000,
-  });
-  const result = Array.isArray(data.results) ? data.results[0] : null;
-  return result ? (result.raw_content || result.content || '').trim() : '';
-}
-
+// ── Fallback fetch (when Tavily extract fails) ──
 async function fallbackFetch(url) {
   const response = await request(url, { timeout: 30000 });
   return response.data
@@ -323,43 +74,128 @@ async function fallbackFetch(url) {
     .slice(0, 50000);
 }
 
+// ── State tracking for unified session ──
+function buildSession(query, provider, queries, sources, answer, context7Result) {
+  return {
+    session_id: `xsearch_${Date.now()}`,
+    query,
+    provider,
+    queries,
+    sources,
+    answer,
+    context7: context7Result || null,
+    created_at: new Date().toISOString(),
+  };
+}
+
+// ── Commands ──
+
+async function cmdSearch(query, options) {
+  const cleanQuery = sanitizeQuery(query);
+  if (!cleanQuery) throw new Error('query is required');
+
+  const config = loadConfig();
+  const model = options.model || config.model || grok.getDefaultModel();
+
+  let answer = '';
+  let sources = [];
+  let provider = '';
+  let queries = [cleanQuery];
+
+  // ── Step 1: Try Grok (primary) ──
+  const grokResult = await grok.search(cleanQuery, model);
+  let detectedLibrary = null;
+  if (grokResult.success) {
+    answer = grokResult.answer;
+    provider = 'Grok';
+    detectedLibrary = grokResult.detectedLibrary;
+    // Strip the LIBRARY: marker before output
+    answer = answer.replace(/\n?LIBRARY:\s*[^\n]*$/m, '');
+    // Extract all URLs from Grok's answer
+    const urlRegex = /https?:\/\/[^\s)\]）]+/g;
+    let match;
+    const extractedUrls = new Set();
+    while ((match = urlRegex.exec(answer)) !== null) {
+      const url = match[0].replace(/[\.\,;]+$/, '');
+      if (!extractedUrls.has(url)) {
+        extractedUrls.add(url);
+        sources.push({ title: `Source ${sources.length + 1}`, url, content: '' });
+      }
+    }
+    sources = dedupeSources(sources);
+  } else {
+    // ── Step 2: Fall back to Tavily ──
+    if (!tavily.hasTavily()) {
+      throw new Error('No search provider available. Configure GROK_API_KEY or TAVILY_API_KEY.');
+    }
+
+    provider = 'Tavily (Grok fallback)';
+    const planMode = options.plan || 'auto';
+    const maxResults = options.max_results || 5;
+    const maxQueries = options.max_queries || 3;
+
+    const usePlan = grok.shouldPlan(cleanQuery, planMode);
+    queries = usePlan ? await grok.planQueries(cleanQuery, maxQueries, model) : [cleanQuery];
+
+    const allResults = [];
+    for (const q of queries) {
+      const results = await tavily.search(q, maxResults);
+      results.forEach((item) => allResults.push({ ...item, query: q }));
+    }
+
+    sources = dedupeSources(allResults);
+    answer = await grok.synthesizeAnswer(cleanQuery, queries, sources, model);
+  }
+
+  // ── Step 3: Context7 (on-demand library docs) ──
+  let context7Result = null;
+  if (context7.hasContext7()) {
+    let libName = detectedLibrary;
+    // Tavily fallback path: Grok key exists but search failed; try detect separately
+    if (!libName && grok.hasGrok()) {
+      try {
+        libName = await grok.detectLibrary(cleanQuery, model);
+      } catch {}
+    }
+    if (libName) {
+      try {
+        context7Result = await context7.searchDocs(cleanQuery, libName);
+      } catch {}
+    }
+  }
+
+  // ── Step 4: Cache and output ──
+  const session = buildSession(cleanQuery, provider, queries, sources, answer, context7Result);
+  cacheSession(session.session_id, session);
+
+  printUnifiedResult(cleanQuery, provider, answer, sources, session.session_id);
+
+  // Append Context7 docs if available
+  if (context7Result && context7Result.found) {
+    console.log(context7.formatDocsResult(context7Result));
+  }
+}
+
 async function cmdFetch(url) {
   const target = sanitizeQuery(url);
   if (!target) throw new Error('url is required');
+
   let content = '';
-  if (hasTavily()) {
+  if (tavily.hasTavily()) {
     try {
-      content = await tavilyExtract(target);
-    } catch {}
+      content = await tavily.extract(target);
+    } catch {
+      // fall through
+    }
   }
   if (!content) content = await fallbackFetch(target);
   console.log(content || '未提取到内容');
 }
 
-async function tavilyMap(url, options) {
-  const data = await requestJson(`${TAVILY_API_URL}/map`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${TAVILY_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      url,
-      max_depth: options.depth || 1,
-      max_breadth: options.breadth || 20,
-      limit: options.limit || 50,
-      format: 'markdown',
-    }),
-    timeout: 60000,
-  });
-  if (Array.isArray(data.results)) return data.results;
-  if (Array.isArray(data.links)) return data.links.map((item) => ({ url: item }));
-  return [];
-}
-
 async function cmdMap(url, options) {
-  if (!hasTavily()) throw new Error('TAVILY_API_KEY not set');
-  const results = await tavilyMap(url, options);
+  if (!tavily.hasTavily()) throw new Error('TAVILY_API_KEY not set');
+  const results = await tavily.siteMap(url, options);
+
   console.log(`## Site Map\n`);
   if (!results.length) {
     console.log('未找到页面');
@@ -375,59 +211,61 @@ async function cmdMap(url, options) {
 function cmdSources(sessionId) {
   const cached = readSession(sessionId);
   if (!cached) throw new Error(`session not found: ${sessionId}`);
+
+  const { formatSourceList } = require('./utils/format');
   console.log(`## Sources for ${sessionId}\n`);
   console.log(`Query: ${cached.query}\n`);
+  console.log(`Provider: ${cached.provider}\n`);
   console.log(formatSourceList(cached.sources || []));
 }
 
 async function cmdConfig() {
   const config = loadConfig();
-  console.log('## X-Search Config\n');
-  console.log(`- GROK_API_URL: ${GROK_API_URL}`);
-  console.log(`- GROK_API_KEY: ${hasGrok() ? `${GROK_API_KEY.slice(0, 4)}***${GROK_API_KEY.slice(-4)}` : 'not set'}`);
-  console.log(`- GROK_MODEL: ${config.model || DEFAULT_MODEL}`);
-  console.log(`- TAVILY_API_URL: ${TAVILY_API_URL}`);
-  console.log(`- TAVILY_API_KEY: ${hasTavily() ? `${TAVILY_API_KEY.slice(0, 4)}***${TAVILY_API_KEY.slice(-4)}` : 'not set'}`);
+  const model = config.model || grok.getDefaultModel();
 
+  console.log('## X-Search Config\n');
+  console.log(`### Grok`);
+  console.log(`- URL: ${grok.getApiUrl()}`);
+  console.log(`- Key: ${grok.hasGrok() ? '✅ configured' : '❌ not set'}`);
+  console.log(`- Model: ${model}`);
+
+  console.log(`\n### Tavily`);
+  console.log(`- URL: ${tavily.getApiUrl()}`);
+  console.log(`- Key: ${tavily.hasTavily() ? '✅ configured' : '❌ not set'}`);
+
+  console.log(`\n### Context7`);
+  console.log(`- URL: ${process.env.CONTEXT7_API_URL || 'https://context7.com/api'}`);
+  console.log(`- Key: ${process.env.CONTEXT7_API_KEY ? '✅ configured' : 'ℹ️  public API (key optional)'}`);
+
+  // Test connectivity
   console.log('\n### Connectivity');
-  try {
-    if (hasTavily()) {
-      await requestJson(`${TAVILY_API_URL}/search`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${TAVILY_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ query: 'hello world', max_results: 1, search_depth: 'basic' }),
-        timeout: 15000,
-      });
-      console.log('- Tavily: ok');
-    } else {
-      console.log('- Tavily: skipped');
+  if (grok.hasGrok()) {
+    try {
+      await grok.grokChat([{ role: 'user', content: 'Hi' }], model);
+      console.log('- Grok: ✅ ok');
+    } catch (err) {
+      console.log(`- Grok: ❌ failed (${err.message})`);
     }
-  } catch (error) {
-    console.log(`- Tavily: failed (${error.message})`);
+  } else {
+    console.log('- Grok: ⏭️  skipped');
   }
 
-  try {
-    if (hasGrok()) {
-      await requestJson(`${GROK_API_URL}/models`, {
-        headers: { Authorization: `Bearer ${GROK_API_KEY}` },
-        timeout: 15000,
-      });
-      console.log('- Grok: ok');
-    } else {
-      console.log('- Grok: skipped');
+  if (tavily.hasTavily()) {
+    try {
+      await tavily.search('hello', 1);
+      console.log('- Tavily: ✅ ok');
+    } catch (err) {
+      console.log(`- Tavily: ❌ failed (${err.message})`);
     }
-  } catch (error) {
-    console.log(`- Grok: failed (${error.message})`);
+  } else {
+    console.log('- Tavily: ⏭️  skipped');
   }
 }
 
 async function cmdModel(name) {
   if (!name) {
     const config = loadConfig();
-    console.log(config.model || DEFAULT_MODEL);
+    console.log(config.model || grok.getDefaultModel());
     return;
   }
   const config = loadConfig();
@@ -451,6 +289,8 @@ Commands:
 `.trim());
 }
 
+// ── CLI Parser ──
+
 function parseArgs(argv) {
   const command = argv[0];
   const options = { _args: [] };
@@ -468,6 +308,8 @@ function parseArgs(argv) {
   }
   return [command, options];
 }
+
+// ── Main ──
 
 (async () => {
   const argv = process.argv.slice(2);

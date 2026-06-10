@@ -1,6 +1,6 @@
 # x-search
 
-轻量实时搜索 skill。Grok 主力 → Tavily 兜底 → Context7 按需补充库文档。
+实时搜索 skill。Grok 主力 → Tavily 兜底 → Context7 按需补充库文档。
 
 ## 依赖
 

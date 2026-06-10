@@ -26,7 +26,7 @@ loadEnv();
 
 // ── Utils (no env dependency) ──
 const { request } = require('./utils/fetch');
-const { ensureCacheDir, cacheSession, readSession } = require('./utils/cache');
+const { cacheSession, readSession } = require('./utils/cache');
 const { dedupeSources, printUnifiedResult } = require('./utils/format');
 
 // ── Providers (need env loaded first) ──
@@ -54,8 +54,6 @@ function saveConfig(config) {
   fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
-
-loadEnv();
 
 // ── Sanitize ──
 function sanitizeQuery(query) {
@@ -111,16 +109,12 @@ async function cmdSearch(query, options) {
     detectedLibrary = grokResult.detectedLibrary;
     // Strip the LIBRARY: marker before output
     answer = answer.replace(/\n?LIBRARY:\s*[^\n]*$/m, '');
-    // Extract all URLs from Grok's answer
-    const urlRegex = /https?:\/\/[^\s)\]）]+/g;
+    // Extract URLs from Grok's answer
+    const urlRe = /https?:\/\/[^\s)\]）>"]+/g;
     let match;
-    const extractedUrls = new Set();
-    while ((match = urlRegex.exec(answer)) !== null) {
-      const url = match[0].replace(/[\.\,;]+$/, '');
-      if (!extractedUrls.has(url)) {
-        extractedUrls.add(url);
-        sources.push({ title: `Source ${sources.length + 1}`, url, content: '' });
-      }
+    while ((match = urlRe.exec(answer)) !== null) {
+      const url = match[0].replace(/[.,;:)\]）]+$/, '');
+      sources.push({ title: `Source ${sources.length + 1}`, url, content: '' });
     }
     sources = dedupeSources(sources);
   } else {
@@ -234,7 +228,7 @@ async function cmdConfig() {
   console.log(`- Key: ${tavily.hasTavily() ? '✅ configured' : '❌ not set'}`);
 
   console.log(`\n### Context7`);
-  console.log(`- URL: ${process.env.CONTEXT7_API_URL || 'https://context7.com/api'}`);
+  console.log(`- URL: ${process.env.CONTEXT7_API_URL || 'https://context7.com/api/v2'}`);
   console.log(`- Key: ${process.env.CONTEXT7_API_KEY ? '✅ configured' : 'ℹ️  optional (higher rate limits with API key)'}`);
 
   // Test connectivity

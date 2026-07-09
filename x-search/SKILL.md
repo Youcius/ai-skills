@@ -1,6 +1,6 @@
 ---
 name: x-search
-description: 实时搜索 skill。适合查最新信息、版本变化、报错方案、官方文档、对比分析、单页抓取、站点结构浏览；支持 Grok/Tavily/Context7，缓存天数可配置，也可关闭缓存。用户一旦提到“搜一下 / 查一下 / 最新 / 官方文档 / 报错怎么解决 / 对比一下 / 看这个网页内容 / 看这个站有哪些页面”，就该优先用它。
+description: 实时搜索与网页读取 skill。用于需求调研、方案设计、漏洞修复、架构升级、报错排查、官方文档查阅、新技术学习、最新新闻/版本/趋势查询、URL 正文提取、docs/官网站点结构浏览；支持 Grok/Tavily/Context7，缓存可配置天数或关闭。
 version: 3.1.0
 authors:
   - Youcius
@@ -158,3 +158,4 @@ Markdown 默认包含：
 - Context7 失败不影响主搜索，只在 `provider_status` 显示原因
 - `fetch` 优先 Tavily 抽取，失败后退回普通网页抓取
 - `map` 需要 Tavily API Key
+

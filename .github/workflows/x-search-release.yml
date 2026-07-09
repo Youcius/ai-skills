@@ -11,6 +11,7 @@ on:
   pull_request:
     paths:
       - "x-search/**"
+      - "dev/x-search-src/**"
       - ".github/workflows/x-search-release.yml"
   workflow_dispatch:
 
@@ -58,13 +59,13 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: x-search
+          workspaces: dev/x-search-src
 
       - name: Build
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cargo build --release --manifest-path x-search/Cargo.toml --target $env:TARGET
+          cargo build --release --manifest-path dev/x-search-src/Cargo.toml --target $env:TARGET
         env:
           TARGET: ${{ matrix.target }}
 
@@ -78,9 +79,11 @@ jobs:
           $packageDir = Join-Path 'dist' ('x-search-' + '${{ matrix.name }}')
           New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
 
-          $builtBinary = Join-Path (Join-Path (Join-Path 'x-search' 'target') $target) (Join-Path 'release' $binary)
+          $builtBinary = Join-Path (Join-Path (Join-Path 'dev/x-search-src' 'target') $target) (Join-Path 'release' $binary)
           Copy-Item -LiteralPath $builtBinary -Destination (Join-Path $packageDir $binary) -Force
           Copy-Item -LiteralPath 'x-search/README.md' -Destination (Join-Path $packageDir 'README.md') -Force
+          Copy-Item -LiteralPath 'x-search/SKILL.md' -Destination (Join-Path $packageDir 'SKILL.md') -Force
+          Copy-Item -LiteralPath 'x-search/runtime.conf' -Destination (Join-Path $packageDir 'runtime.conf') -Force
           Copy-Item -LiteralPath 'x-search/.env.example' -Destination (Join-Path $packageDir '.env.example') -Force
 
           if ($IsWindows) {

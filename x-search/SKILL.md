@@ -41,7 +41,6 @@ credentials:
 开发调试时可用：
 
 ```bash
-cargo run --quiet --manifest-path <skill_dir>/Cargo.toml --
 ```
 
 ## 常用命令

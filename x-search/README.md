@@ -6,7 +6,6 @@
 
 - Windows：无需安装 Rust，仓库已内置 `bin/x-search.exe`
 - macOS / Linux：从 GitHub Releases 下载对应平台压缩包，无需安装 Rust
-- 开发/重新编译：Rust 1.75+
 - API Key：Grok 和/或 Tavily（至少一个）
 
 ## 安装
@@ -28,20 +27,11 @@ bin/x-search.exe cache off                    # 关闭缓存
 bin/x-search.exe doc                          # 查看全部命令
 ```
 
-开发时也可以直接：
-
-```bash
-cargo run -- search "xxx"
-```
-
-重新编译并更新内置 exe：
-
-```bash
-cargo build --release
-cp target/release/x-search.exe bin/x-search.exe
-```
-
 详细说明见 `SKILL.md`。
+
+## 源码
+
+运行包不包含源码。需要开发或重新编译时，查看仓库内的 `dev/x-search-src/`。
 
 ## 多平台发布
 

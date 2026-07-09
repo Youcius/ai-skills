@@ -1405,14 +1405,14 @@ fn find_skill_dir() -> Result<PathBuf> {
         .and_then(|p| p.parent().map(Path::to_path_buf));
     let cwd = env::current_dir().context("failed to get current dir")?;
     let mut candidates = Vec::new();
-    candidates.push(cwd.clone());
-    candidates.push(cwd.join("x-search"));
     if let Some(dir) = exe_dir {
         candidates.push(dir.clone());
         candidates.push(dir.join(".."));
         candidates.push(dir.join("..").join(".."));
         candidates.push(dir.join("..").join("..").join(".."));
     }
+    candidates.push(cwd.clone());
+    candidates.push(cwd.join("x-search"));
     if let Some(home) = dirs::home_dir() {
         candidates.push(home.join(".agents").join("skills").join("x-search"));
     }

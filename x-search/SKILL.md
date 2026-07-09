@@ -1,6 +1,6 @@
 ---
 name: x-search
-description: 实时搜索 skill。适合查最新信息、版本变化、报错方案、官方文档、对比分析、单页抓取、站点结构浏览。用户一旦提到“搜一下 / 查一下 / 最新 / 官方文档 / 报错怎么解决 / 对比一下 / 看这个网页内容 / 看这个站有哪些页面”，就该优先用它。
+description: 实时搜索 skill。适合查最新信息、版本变化、报错方案、官方文档、对比分析、单页抓取、站点结构浏览；支持 Grok/Tavily/Context7，缓存天数可配置，也可关闭缓存。用户一旦提到“搜一下 / 查一下 / 最新 / 官方文档 / 报错怎么解决 / 对比一下 / 看这个网页内容 / 看这个站有哪些页面”，就该优先用它。
 version: 3.1.0
 authors:
   - Youcius
@@ -56,6 +56,9 @@ cargo run --quiet --manifest-path <skill_dir>/Cargo.toml --
 <cmd> config
 <cmd> model
 <cmd> model grok-4
+<cmd> cache
+<cmd> cache 7
+<cmd> cache off
 <cmd> doc
 ```
 
@@ -119,6 +122,16 @@ cargo run --quiet --manifest-path <skill_dir>/Cargo.toml --
 ```bash
 <cmd> model
 <cmd> model grok-4
+
+### `cache`
+
+查看或设置搜索缓存。默认缓存 1 天；设置为 `off` 或 `0` 表示不缓存。
+
+```bash
+<cmd> cache
+<cmd> cache 7
+<cmd> cache off
+```
 ```
 
 ## 输出要求
@@ -136,7 +149,7 @@ Markdown 默认包含：
 - `provider_status`：Grok / Tavily / Context7 成功或失败原因
 - `session_id`：可用 `sources <session_id>` 回看来源
 - `来源`：固定编号 `[1] [2] ...`
-- 缓存只保留 24 小时，过期会自动清理
+- 缓存默认保留 1 天，可用 `cache <days>` 修改；`cache off` 可关闭缓存
 
 ## 回退规则
 

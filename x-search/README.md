@@ -23,6 +23,8 @@ cp .env.example .env   # 填入你的 API Key
 bin/x-search.exe config                       # 检查配置
 bin/x-search.exe search "xxx"                 # 搜索
 bin/x-search.exe search "xxx" --format json
+bin/x-search.exe cache 7                      # 缓存保留 7 天
+bin/x-search.exe cache off                    # 关闭缓存
 bin/x-search.exe doc                          # 查看全部命令
 ```
 

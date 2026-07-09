@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const SCHEMA_VERSION: &str = "x-search.session.v2";
-const CACHE_TTL_HOURS: i64 = 24;
+const DEFAULT_CACHE_TTL_DAYS: i64 = 1;
 const DEFAULT_GROK_API_URL: &str = "https://api.x.ai/v1";
 const DEFAULT_GROK_MODEL: &str = "grok-4.20-fast";
 const DEFAULT_TAVILY_API_URL: &str = "https://api.tavily.com";
@@ -75,6 +75,9 @@ enum Command {
     Model {
         name: Option<String>,
     },
+    Cache {
+        value: Option<String>,
+    },
     #[command(alias = "docs")]
     Doc,
 }
@@ -126,6 +129,7 @@ struct Context7 {
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 struct UserConfig {
     model: Option<String>,
+    cache_ttl_days: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -304,6 +308,9 @@ async fn run() -> Result<()> {
         }
         Command::Model { name } => {
             app.model_cmd(name)?;
+        }
+        Command::Cache { value } => {
+            app.cache_cmd(value)?;
         }
         Command::Doc => {
             print_doc();
@@ -990,7 +997,43 @@ impl App {
         Ok(())
     }
 
+    fn cache_cmd(&self, value: Option<String>) -> Result<()> {
+        let mut config = self.load_config();
+        if let Some(value) = value {
+            let value = value.trim().to_lowercase();
+            config.cache_ttl_days = Some(match value.as_str() {
+                "off" | "false" | "none" | "no" | "disable" | "disabled" => 0,
+                _ => value
+                    .parse::<i64>()
+                    .context("cache value must be days, or off")?,
+            });
+            if config.cache_ttl_days.unwrap_or(DEFAULT_CACHE_TTL_DAYS) < 0 {
+                return Err(anyhow!("cache days must be >= 0"));
+            }
+            self.save_config(&config)?;
+        }
+
+        let days = config.cache_ttl_days.unwrap_or(DEFAULT_CACHE_TTL_DAYS);
+        if days == 0 {
+            println!("cache = off");
+        } else {
+            println!("cache = {days} day(s)");
+        }
+        Ok(())
+    }
+
+    fn cache_ttl_days(&self) -> i64 {
+        self.load_config()
+            .cache_ttl_days
+            .unwrap_or(DEFAULT_CACHE_TTL_DAYS)
+            .max(0)
+    }
+
     fn cache_session(&self, session: &SearchSession) -> Result<()> {
+        if self.cache_ttl_days() == 0 {
+            self.cleanup_cache()?;
+            return Ok(());
+        }
         fs::create_dir_all(&self.cache_dir)?;
         self.cleanup_cache()?;
         let file = self.cache_dir.join(format!("{}.json", session.session_id));
@@ -1010,7 +1053,18 @@ impl App {
         if !self.cache_dir.exists() {
             return Ok(());
         }
-        let cutoff = Utc::now() - ChronoDuration::hours(CACHE_TTL_HOURS);
+        let ttl_days = self.cache_ttl_days();
+        if ttl_days == 0 {
+            for entry in fs::read_dir(&self.cache_dir)? {
+                let path = entry?.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    let _ = fs::remove_file(path);
+                }
+            }
+            return Ok(());
+        }
+
+        let cutoff = Utc::now() - ChronoDuration::days(ttl_days);
         for entry in fs::read_dir(&self.cache_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -1109,6 +1163,7 @@ impl App {
             skill_dir: self.skill_dir.display().to_string(),
             config_file: self.config_file.display().to_string(),
             cache_dir: self.cache_dir.display().to_string(),
+            cache_ttl_days: self.cache_ttl_days(),
             connectivity,
         }
     }
@@ -1140,6 +1195,7 @@ struct ConfigReport {
     skill_dir: String,
     config_file: String,
     cache_dir: String,
+    cache_ttl_days: i64,
     connectivity: Vec<ProviderStatus>,
 }
 
@@ -1333,7 +1389,7 @@ fn print_config(report: ConfigReport, format: OutputFormat) {
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
         OutputFormat::Compact => println!(
-            "Grok: {} | Tavily: {} | model: {}",
+            "Grok: {} | Tavily: {} | model: {} | cache: {}",
             if report.grok_key_configured {
                 "configured"
             } else {
@@ -1344,7 +1400,8 @@ fn print_config(report: ConfigReport, format: OutputFormat) {
             } else {
                 "missing"
             },
-            report.model
+            report.model,
+            format_cache_ttl(report.cache_ttl_days)
         ),
         OutputFormat::Markdown => {
             println!("# X-Search Config\n");
@@ -1383,6 +1440,8 @@ fn print_config(report: ConfigReport, format: OutputFormat) {
             println!("- skill_dir: {}", report.skill_dir);
             println!("- config_file: {}", report.config_file);
             println!("- cache_dir: {}\n", report.cache_dir);
+            println!("## Cache\n");
+            println!("- ttl: {}\n", format_cache_ttl(report.cache_ttl_days));
             println!("## Connectivity\n");
             for status in report.connectivity {
                 println!(
@@ -1425,12 +1484,15 @@ Commands:
   sources <session_id> [--format markdown|json|compact]
   config [--format markdown|json|compact]
   model [name]
+  cache [days|off]
   doc
 
 Examples:
   x-search search "Next.js 15 cache changes"
   x-search search "React 19 和 Vue 3.5 对比" --plan force --format json
   x-search fetch "https://example.com/page"
+  x-search cache 7
+  x-search cache off
 "#
     );
 }
@@ -1615,6 +1677,14 @@ fn first_non_heading_line(text: &str) -> String {
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| truncate_chars(line, 160))
         .unwrap_or_else(|| "no answer".to_string())
+}
+
+fn format_cache_ttl(days: i64) -> String {
+    if days <= 0 {
+        "off".to_string()
+    } else {
+        format!("{days} day(s)")
+    }
 }
 
 fn html_to_text(html: &str) -> String {

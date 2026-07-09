@@ -1413,9 +1413,6 @@ fn find_skill_dir() -> Result<PathBuf> {
     }
     candidates.push(cwd.clone());
     candidates.push(cwd.join("x-search"));
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".agents").join("skills").join("x-search"));
-    }
     for candidate in candidates {
         let candidate = candidate.canonicalize().unwrap_or(candidate);
         if candidate.join("SKILL.md").exists() && candidate.join("runtime.conf").exists() {
@@ -1426,15 +1423,7 @@ fn find_skill_dir() -> Result<PathBuf> {
 }
 
 fn load_env_files(skill_dir: &Path) -> Result<()> {
-    let mut candidates = vec![skill_dir.join(".env"), skill_dir.join(".env.local")];
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(
-            home.join(".agents")
-                .join("skills")
-                .join("x-search")
-                .join(".env"),
-        );
-    }
+    let candidates = [skill_dir.join(".env"), skill_dir.join(".env.local")];
     for file in candidates {
         if file.exists() {
             load_env_file(&file)?;

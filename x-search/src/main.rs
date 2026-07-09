@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::stream::{self, StreamExt};
 use regex::Regex;
@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const SCHEMA_VERSION: &str = "x-search.session.v2";
+const CACHE_TTL_HOURS: i64 = 24;
 const DEFAULT_GROK_API_URL: &str = "https://api.x.ai/v1";
 const DEFAULT_GROK_MODEL: &str = "grok-4.20-fast";
 const DEFAULT_TAVILY_API_URL: &str = "https://api.tavily.com";
@@ -991,16 +992,51 @@ impl App {
 
     fn cache_session(&self, session: &SearchSession) -> Result<()> {
         fs::create_dir_all(&self.cache_dir)?;
+        self.cleanup_cache()?;
         let file = self.cache_dir.join(format!("{}.json", session.session_id));
         fs::write(file, serde_json::to_string_pretty(session)?)?;
         Ok(())
     }
 
     fn read_session(&self, session_id: &str) -> Result<SearchSession> {
+        self.cleanup_cache()?;
         let file = self.cache_dir.join(format!("{session_id}.json"));
         let text = fs::read_to_string(&file)
             .with_context(|| format!("session not found: {session_id}"))?;
         serde_json::from_str(&text).context("invalid session cache")
+    }
+
+    fn cleanup_cache(&self) -> Result<()> {
+        if !self.cache_dir.exists() {
+            return Ok(());
+        }
+        let cutoff = Utc::now() - ChronoDuration::hours(CACHE_TTL_HOURS);
+        for entry in fs::read_dir(&self.cache_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+
+            let expired = fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<SearchSession>(&text).ok())
+                .map(|session| session.checked_at < cutoff)
+                .unwrap_or_else(|| {
+                    entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| DateTime::<Utc>::try_from(t).ok())
+                        .map(|modified_at| modified_at < cutoff)
+                        .unwrap_or(false)
+                });
+
+            if expired {
+                let _ = fs::remove_file(path);
+            }
+        }
+        Ok(())
     }
 
     async fn config_report(&self) -> ConfigReport {

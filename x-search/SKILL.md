@@ -133,6 +133,7 @@ Markdown 默认包含：
 - `provider_status`：Grok / Tavily / Context7 成功或失败原因
 - `session_id`：可用 `sources <session_id>` 回看来源
 - `来源`：固定编号 `[1] [2] ...`
+- 缓存只保留 24 小时，过期会自动清理
 
 ## 回退规则
 

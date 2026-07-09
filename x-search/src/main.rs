@@ -1409,6 +1409,7 @@ fn find_skill_dir() -> Result<PathBuf> {
     candidates.push(cwd.join("x-search"));
     if let Some(dir) = exe_dir {
         candidates.push(dir.clone());
+        candidates.push(dir.join(".."));
         candidates.push(dir.join("..").join(".."));
         candidates.push(dir.join("..").join("..").join(".."));
     }

@@ -1,0 +1,127 @@
+name: x-search release
+
+on:
+  push:
+    tags:
+      - "x-search-v*"
+      - "v*"
+    branches:
+      - main
+      - master
+  pull_request:
+    paths:
+      - "x-search/**"
+      - ".github/workflows/x-search-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: x-search.exe
+            archive: x-search-windows-x86_64.zip
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: x-search
+            archive: x-search-linux-x86_64.tar.gz
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            binary: x-search
+            archive: x-search-macos-x86_64.tar.gz
+          - name: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            binary: x-search
+            archive: x-search-macos-aarch64.tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: x-search
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --manifest-path x-search/Cargo.toml --target $env:TARGET
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = '${{ matrix.target }}'
+          $binary = '${{ matrix.binary }}'
+          $archive = '${{ matrix.archive }}'
+          $packageDir = Join-Path 'dist' ('x-search-' + '${{ matrix.name }}')
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+
+          $builtBinary = Join-Path (Join-Path (Join-Path 'x-search' 'target') $target) (Join-Path 'release' $binary)
+          Copy-Item -LiteralPath $builtBinary -Destination (Join-Path $packageDir $binary) -Force
+          Copy-Item -LiteralPath 'x-search/README.md' -Destination (Join-Path $packageDir 'README.md') -Force
+          Copy-Item -LiteralPath 'x-search/.env.example' -Destination (Join-Path $packageDir '.env.example') -Force
+
+          if ($IsWindows) {
+            Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath (Join-Path 'dist' $archive) -Force
+          } else {
+            tar -czf (Join-Path 'dist' $archive) -C $packageDir .
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $notes = @"
+          x-search 多平台预编译包。
+
+          使用方式：
+          1. 下载对应平台压缩包
+          2. 解压
+          3. 复制 .env.example 为 .env 并配置 API Key
+          4. 运行 x-search config
+          "@
+          gh release create $env:TAG_NAME dist/* --title $env:TAG_NAME --notes $notes

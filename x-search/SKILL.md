@@ -158,4 +158,3 @@ Markdown 默认包含：
 - Context7 失败不影响主搜索，只在 `provider_status` 显示原因
 - `fetch` 优先 Tavily 抽取，失败后退回普通网页抓取
 - `map` 需要 Tavily API Key
-

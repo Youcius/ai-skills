@@ -6,7 +6,7 @@
 
 | 技能 | 说明 | 运行环境 |
 |:---|:---|:---:|
-| [x-search](./x-search/) | 轻量实时搜索，支持 Grok → Tavily → Context7 多提供商自动切换 | Rust CLI |
+| [x-search](./x-search/) | 实时搜索、网页读取、官方文档与最新信息查询 | Node.js 18+ |
 | [improve-codebase-architecture](./improve-codebase-architecture/) | 扫描代码库架构机会，生成《星际穿越》太空感 HTML 报告 | 纯 HTML |
 
 ## 安装

@@ -17,14 +17,14 @@ function getApiUrl() {
 /**
  * Search via Tavily API.
  */
-async function search(query, maxResults) {
+async function search(query, maxResults, options = {}) {
   if (!hasTavily()) throw new Error('TAVILY_API_KEY not set');
   const freshness = detectFreshness(query);
   const body = {
     query,
     max_results: maxResults,
     search_depth: 'advanced',
-    include_answer: false,
+    include_answer: 'advanced',
     include_raw_content: false,
     topic: freshness.topic,
   };
@@ -37,9 +37,13 @@ async function search(query, maxResults) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
-    timeout: 60000,
+    timeout: options.timeout ?? 60000,
+    retries: options.retries,
   });
-  return Array.isArray(data.results) ? data.results : [];
+  return {
+    results: Array.isArray(data.results) ? data.results : [],
+    answer: typeof data.answer === 'string' ? data.answer.trim() : '',
+  };
 }
 
 /**

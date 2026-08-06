@@ -5,6 +5,7 @@ const { requestJson } = require('../utils/fetch');
 const GROK_API_URL = process.env.GROK_API_URL || 'https://api.x.ai/v1';
 const GROK_API_KEY = process.env.GROK_API_KEY || '';
 const DEFAULT_MODEL = process.env.GROK_MODEL || 'grok-4.20-fast';
+const DEFAULT_TIMEOUT_MS = 120000;
 
 function hasGrok() {
   return Boolean(GROK_API_KEY);
@@ -21,7 +22,7 @@ function getDefaultModel() {
 /**
  * Call Grok chat completions (endpoint has built-in web search).
  */
-async function grokChat(messages, model) {
+async function grokChat(messages, model, options = {}) {
   const data = await requestJson(`${GROK_API_URL}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -33,142 +34,98 @@ async function grokChat(messages, model) {
       messages,
       stream: false,
     }),
-    timeout: 120000,
+    timeout: options.timeout ?? DEFAULT_TIMEOUT_MS,
+    retries: options.retries,
   });
   const content = data.choices?.[0]?.message?.content || '';
   return content;
 }
 
-/**
- * Break a query into sub-queries (for Tavily fallback scenario).
- */
-async function planQueries(query, maxQueries, model) {
-  if (!hasGrok()) return [query];
-  try {
-    const text = await grokChat(
-      [
-        {
-          role: 'system',
-          content:
-            'You break a user research query into a few non-overlapping web search queries. Return JSON only: {"queries":["..."]}. Keep each query short and specific. Max ' +
-            maxQueries +
-            ' queries.',
-        },
-        { role: 'user', content: query },
-      ],
-      model
-    );
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return [query];
-    const parsed = JSON.parse(match[0]);
-    const queries = Array.isArray(parsed.queries) ? parsed.queries.map(s => String(s || '').replace(/\s+/g, ' ').trim()).filter(Boolean) : [];
-    return queries.slice(0, maxQueries).length ? queries.slice(0, maxQueries) : [query];
-  } catch {
-    return [query];
-  }
-}
+const JSON_SYSTEM_PROMPT =
+  'You are one independent web-search provider. Return your own findings for the query, with concrete dates and source URLs when available. Do not assume or describe results from any other provider. ' +
+  'Respond with ONLY a JSON object (no markdown fences, no extra text) in exactly this shape: ' +
+  '{"answer": "your findings as a single string, citing concrete dates", ' +
+  '"sources": [{"title": "page title", "url": "https://example.com/page", "date": "as available"}], ' +
+  '"library": "the name of the library, framework, or tool this query asks about (e.g. React, Vue, Next.js, PyTorch); set it to an empty string when the query is not about a specific library"}';
 
-/**
- * Decide whether a query needs sub-query planning.
- */
-function shouldPlan(query, mode) {
-  if (mode === 'force') return true;
-  if (mode === 'off') return false;
-  const q = query.toLowerCase();
-  if (query.length > 36) return true;
-  if (/vs\b|compare|comparison|difference|tradeoff|error|issue|best practice|migration/i.test(q)) return true;
-  if (/[对比区别差异怎么解决报错原因迁移方案]/.test(query)) return true;
-  return false;
+function parseJsonAnswer(text) {
+  const clean = String(text || '').trim();
+  const candidates = [clean];
+  const fenced = clean.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenced) candidates.push(fenced[1].trim());
+  const first = clean.indexOf('{');
+  const last = clean.lastIndexOf('}');
+  if (first !== -1 && last > first) candidates.push(clean.slice(first, last + 1));
+  for (const candidate of candidates) {
+    try {
+      const value = JSON.parse(candidate);
+      if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+    } catch {}
+  }
+  return null;
 }
 
 /**
  * Try Grok search (built-in web search).
- * Returns { success, answer, detectedLibrary }.
- * If the query is about a library/framework, Grok annotates it
- * so we can trigger Context7 without an extra API call.
+ * Returns { success, answer, sources, detectedLibrary, structured }.
+ * Grok is asked to respond with structured JSON; when it does not,
+ * the CLI falls back to extracting URLs from the plain-text answer.
  */
-async function search(query, model) {
+async function search(query, model, options = {}) {
   if (!hasGrok()) {
     return { success: false, reason: 'GROK_API_KEY not set' };
   }
   try {
     const answer = await grokChat(
       [
-        {
-          role: 'system',
-          content:
-            'You are a helpful assistant with web search. Answer the user question.\n' +
-            'IMPORTANT: If the user is asking about a specific library, framework, or tool ' +
-            '(e.g. React, Vue, Next.js, Express, Prisma, PyTorch, etc.), ' +
-            'end your answer with a line like: LIBRARY: React\n' +
-            'If not about a library, do not add this line.',
-        },
+        { role: 'system', content: JSON_SYSTEM_PROMPT },
         { role: 'user', content: query },
       ],
-      model
+      model,
+      { timeout: options.timeout, retries: options.retries }
     );
-    if (answer) {
-      // Extract library annotation
-      const libMatch = answer.match(/LIBRARY:\s*(.+)\s*$/m);
-      const detectedLibrary = libMatch ? libMatch[1].trim() : null;
-      return { success: true, answer, detectedLibrary };
+    if (!answer) {
+      return { success: false, reason: 'empty response' };
     }
-    return { success: false, reason: 'empty response' };
+
+    const parsed = parseJsonAnswer(answer);
+    if (parsed) {
+      const sources = Array.isArray(parsed.sources)
+        ? parsed.sources
+            .map((item) => {
+              if (typeof item === 'string') {
+                return { title: 'source', url: item, date: null };
+              }
+              if (!item || !item.url) return null;
+              return {
+                title: String(item.title || 'Untitled'),
+                url: String(item.url),
+                date: item.date !== undefined && item.date !== null ? String(item.date) : null,
+              };
+            })
+            .filter(Boolean)
+        : [];
+      return {
+        success: true,
+        answer: parsed.answer !== undefined ? String(parsed.answer) : answer,
+        sources,
+        detectedLibrary: parsed.library ? String(parsed.library).trim() : null,
+        structured: true,
+      };
+    }
+
+    // 回退：模型未按 JSON 返回时保留原始回答与 LIBRARY 标注，来源由 CLI 正则提取
+    const libMatch = answer.match(/LIBRARY:\s*(.+)\s*$/m);
+    return {
+      success: true,
+      answer,
+      sources: null,
+      detectedLibrary: libMatch ? libMatch[1].trim() : null,
+      structured: false,
+    };
   } catch (err) {
     return { success: false, reason: err.message };
   }
 }
 
-/**
- * Synthesize an answer from Tavily sources using Grok.
- */
-async function synthesizeAnswer(originalQuery, queries, sources, model) {
-  if (!hasGrok()) return '';
-  const { buildSourceContext } = require('../utils/format');
-  const prompt = [
-    'Answer the user using only the provided sources.',
-    'Use citation markers like [1], [2].',
-    'If the sources are insufficient, say so plainly.',
-    'Prefer concrete dates for time-sensitive information.',
-    '',
-    `User question: ${originalQuery}`,
-    `Search queries used: ${queries.join(' | ')}`,
-    '',
-    'Sources:',
-    buildSourceContext(sources),
-  ].join('\n');
-  return grokChat(
-    [
-      { role: 'system', content: 'You are a concise research assistant.' },
-      { role: 'user', content: prompt },
-    ],
-    model
-  );
-}
-
-/**
- * Ask Grok whether the query is about a specific library/framework.
- * Returns library name or null.
- */
-async function detectLibrary(query, model) {
-  if (!hasGrok()) return null;
-  try {
-    const text = await grokChat(
-      [
-        {
-          role: 'system',
-          content:
-            'The user is asking about a library or framework. If they are, reply with ONLY the library/framework name (e.g. "React", "Next.js", "Vue"). If not, reply with "null". No explanation.',
-        },
-        { role: 'user', content: query },
-      ],
-      model
-    );
-    const name = text.trim();
-    return name && name !== 'null' && name !== 'None' ? name : null;
-  } catch {
-    return null;
-  }
-}
-
-module.exports = { hasGrok, getApiUrl, getDefaultModel, grokChat, planQueries, shouldPlan, search, synthesizeAnswer, detectLibrary };
+module.exports = { hasGrok, getApiUrl, getDefaultModel, grokChat, search };

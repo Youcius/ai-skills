@@ -3,10 +3,13 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const SKILL_DIR = path.resolve(__dirname, '..');
 const CONFIG_FILE = path.join(process.env.HOME || process.env.USERPROFILE || '.', '.config', 'x-search', 'config.json');
 const DEFAULT_CACHE_TTL_DAYS = 1;
+// 时效性查询（新闻/最新）的缓存上限：1 小时，避免新闻变旧闻还命中缓存
+const FRESH_CACHE_TTL_DAYS = 1 / 24;
 
 function unquote(value) {
   if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
@@ -42,9 +45,10 @@ function loadEnv() {
 }
 loadEnv();
 
-const { request } = require('./utils/fetch');
+const { getSafeLookup } = require('./utils/network');
 const { cacheSession, readSession, cleanupCache } = require('./utils/cache');
 const { dedupeSources, printSearchResult, printSources } = require('./utils/format');
+const { detectFreshness } = require('./utils/freshness');
 const grok = require('./providers/grok');
 const tavily = require('./providers/tavily');
 const context7 = require('./providers/context7');
@@ -71,6 +75,10 @@ function sanitize(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+function queryHash(query) {
+  return crypto.createHash('md5').update(query, 'utf8').digest('hex').slice(0, 12);
+}
+
 function providerStatus(name, ok, detail) {
   return { name, ok, detail: detail || null };
 }
@@ -88,32 +96,144 @@ function extractSources(answer) {
   return dedupeSources(found);
 }
 
-function fallbackAnswer(sources) {
-  if (!sources.length) return '## 结论\n\n未找到足够来源。\n\n## 不确定或缺口\n\n- 没有可用来源。';
-  const lines = ['## 结论', '', '已找到相关来源，但当前没有可用模型生成综合结论。', '', '## 关键要点', ''];
-  sources.slice(0, 5).forEach((source, index) => {
-    const text = sanitize(source.content || source.title).slice(0, 180);
-    lines.push(`- ${text} [${index + 1}]`);
-  });
-  lines.push('', '## 不确定或缺口', '', '- 未经过模型综合，只展示来源摘要。');
-  return lines.join('\n');
+function skippedProvider(name, detail) {
+  return {
+    provider: name,
+    ok: false,
+    status: 'skipped',
+    elapsed_ms: 0,
+    detail,
+    answer: '',
+    sources: [],
+  };
 }
 
-async function fallbackFetch(url, allowPrivate = false) {
-  const response = await request(url, {
-    timeout: 30000,
-    retries: 2,
-    maxRedirects: 5,
-    maxResponseBytes: 10 * 1024 * 1024,
-    blockPrivate: !allowPrivate,
-  });
-  return response.data
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s{2,}/g, '\n')
-    .trim()
-    .slice(0, 50000);
+async function runProvider(name, action) {
+  const startedAt = Date.now();
+  try {
+    const value = await action();
+    return {
+      provider: name,
+      ok: true,
+      status: 'success',
+      elapsed_ms: Date.now() - startedAt,
+      value,
+    };
+  } catch (error) {
+    return {
+      provider: name,
+      ok: false,
+      status: 'failed',
+      elapsed_ms: Date.now() - startedAt,
+      detail: error.message,
+      value: null,
+    };
+  }
+}
+
+function normalizeGrokResult(attempt) {
+  const base = {
+    provider: 'Grok',
+    ok: attempt.ok,
+    status: attempt.status,
+    elapsed_ms: attempt.elapsed_ms,
+  };
+  if (!attempt.ok) {
+    return {
+      ...base,
+      detail: attempt.detail || 'Grok request failed',
+      answer: '',
+      sources: [],
+      detected_library: null,
+      source_note: 'Grok unavailable',
+    };
+  }
+
+  const value = attempt.value || {};
+  if (!value.success) {
+    return {
+      ...base,
+      ok: false,
+      status: 'failed',
+      detail: value.reason || 'Grok returned no result',
+      answer: '',
+      sources: [],
+      detected_library: null,
+      source_note: 'Grok unavailable',
+    };
+  }
+
+  const answer = String(value.answer || '')
+    .replace(/\n?LIBRARY:\s*[^\n]*$/m, '')
+    .trim();
+  const structured = value.structured === true && Array.isArray(value.sources);
+  const sources = structured
+    ? dedupeSources(
+        value.sources.map((item) => ({
+          title: item.title,
+          url: item.url,
+          published_date: item.date,
+          content: '',
+        }))
+      )
+    : extractSources(answer);
+  return {
+    ...base,
+    detail: `${sources.length} source(s) in ${attempt.elapsed_ms}ms${structured ? '' : ' (regex fallback)'}`,
+    answer,
+    sources,
+    detected_library: value.detectedLibrary || null,
+    source_note: structured
+      ? 'Structured sources returned by Grok in JSON response'
+      : 'URLs extracted from the Grok response; not merged or independently verified by this CLI',
+  };
+}
+
+function normalizeTavilyResult(attempt, query) {
+  const base = {
+    provider: 'Tavily',
+    ok: attempt.ok,
+    status: attempt.status,
+    elapsed_ms: attempt.elapsed_ms,
+  };
+  if (!attempt.ok) {
+    return {
+      ...base,
+      detail: attempt.detail || 'Tavily request failed',
+      queries: [query],
+      answer: '',
+      sources: [],
+      source_note: 'Tavily unavailable',
+    };
+  }
+
+  const value = attempt.value || {};
+  const rawSources = Array.isArray(value.results) ? value.results : [];
+  const sources = dedupeSources(rawSources.map((item) => ({ ...item, query })));
+  return {
+    ...base,
+    detail: `${sources.length} structured source(s) in ${attempt.elapsed_ms}ms`,
+    queries: [query],
+    answer: value.answer || '',
+    sources,
+    source_note: 'Structured results returned directly by Tavily; answer is Tavily AI-generated',
+  };
+}
+
+function providerStatusFromResult(result) {
+  const detail = result.ok
+    ? result.detail || `success in ${result.elapsed_ms}ms`
+    : `${result.status}: ${result.detail || 'unavailable'}`;
+  return providerStatus(result.provider, result.ok, detail);
+}
+
+function resolveSearchTimeout(config, options) {
+  const value = options.timeout_ms ?? config.search_timeout_ms ?? 30000;
+  const timeout = Number(value);
+  if (!Number.isInteger(timeout) || timeout < 1000 || timeout > 120000) {
+    throw new Error('timeout-ms must be an integer between 1000 and 120000');
+  }
+  return timeout;
 }
 
 async function cmdSearch(query, options) {
@@ -122,84 +242,102 @@ async function cmdSearch(query, options) {
 
   const config = loadConfig();
   const model = options.model || config.model || grok.getDefaultModel();
-  let provider = '';
-  let answer = '';
-  let sources = [];
-  let queries = [cleanQuery];
-  let detectedLibrary = null;
-  const statuses = [];
+  const timeout = resolveSearchTimeout(config, options);
+  const maxResults = options.max_results || 5;
+  const format = options.format || 'markdown';
 
-  const grokResult = await grok.search(cleanQuery, model);
-  if (grokResult.success) {
-    provider = 'Grok';
-    answer = grokResult.answer.replace(/\n?LIBRARY:\s*[^\n]*$/m, '').trim();
-    detectedLibrary = grokResult.detectedLibrary;
-    sources = extractSources(answer);
-    statuses.push(providerStatus('Grok', true, 'primary search succeeded'));
-  } else {
-    statuses.push(providerStatus('Grok', false, grokResult.reason || 'search failed'));
-    if (!tavily.hasTavily()) throw new Error('No search provider available. Configure GROK_API_KEY or TAVILY_API_KEY.');
-
-    const maxResults = options.max_results || 5;
-    const maxQueries = options.max_queries || 3;
-    queries = grok.shouldPlan(cleanQuery, options.plan || 'auto')
-      ? await grok.planQueries(cleanQuery, maxQueries, model)
-      : [cleanQuery];
-
-    const batches = await Promise.all(queries.map(async (item) => {
-      const results = await tavily.search(item, maxResults);
-      return results.map((result) => ({ ...result, query: item }));
-    }));
-    sources = dedupeSources(batches.flat());
-    statuses.push(providerStatus('Tavily', true, `${sources.length} unique source(s)`));
-
-    if (grok.hasGrok()) {
-      try {
-        answer = await grok.synthesizeAnswer(cleanQuery, queries, sources, model);
-        provider = 'Tavily + Grok synthesis';
-      } catch (error) {
-        statuses.push(providerStatus('Grok synthesis', false, error.message));
-        answer = fallbackAnswer(sources);
-        provider = 'Tavily';
-      }
-    } else {
-      answer = fallbackAnswer(sources);
-      provider = 'Tavily';
-    }
+  if (!grok.hasGrok() && !tavily.hasTavily()) {
+    throw new Error('No search provider available. Configure GROK_API_KEY or TAVILY_API_KEY.');
   }
 
+  // 缓存按查询内容命中（相同 query 复用结果，省 API 调用）；
+  // 时效性查询（新闻/最新）使用更短的缓存时间，避免旧闻命中。
+  const freshness = detectFreshness(cleanQuery);
+  const ttlDays = freshness.isFresh
+    ? Math.min(cacheTtlDays(config), FRESH_CACHE_TTL_DAYS)
+    : cacheTtlDays(config);
+  const sessionId = `xsearch_${queryHash(cleanQuery)}`;
+
+  const cached = readSession(sessionId, ttlDays);
+  if (cached) {
+    printSearchResult(cached, format);
+    if (format === 'markdown' && cached.context7?.found) {
+      console.log(context7.formatDocsResult(cached.context7));
+    }
+    return;
+  }
+
+  // Start both providers before awaiting either one. A failure or timeout in
+  // one provider must not prevent the other provider from returning evidence.
+  const [grokAttempt, tavilyAttempt] = await Promise.all([
+    grok.hasGrok()
+      ? runProvider('Grok', () => grok.search(cleanQuery, model, { timeout, retries: 2 }))
+      : Promise.resolve(skippedProvider('Grok', 'GROK_API_KEY not set')),
+    tavily.hasTavily()
+      ? runProvider('Tavily', () => tavily.search(cleanQuery, maxResults, { timeout, retries: 2 }))
+      : Promise.resolve(skippedProvider('Tavily', 'TAVILY_API_KEY not set')),
+  ]);
+
+  const grokResult = normalizeGrokResult(grokAttempt);
+  const tavilyResult = normalizeTavilyResult(tavilyAttempt, cleanQuery);
+  const providerResults = { grok: grokResult, tavily: tavilyResult };
+  const statuses = [providerStatusFromResult(grokResult), providerStatusFromResult(tavilyResult)];
+
+  // Context7 remains an independent documentation supplement. It only runs
+  // when Grok explicitly identifies a library; it never synthesizes either
+  // search result and never decides whether the main search succeeded.
   let context7Result = null;
-  if (context7.hasContext7()) {
-    let libraryName = detectedLibrary;
-    if (!libraryName && grok.hasGrok()) {
-      try { libraryName = await grok.detectLibrary(cleanQuery, model); } catch {}
-    }
-    if (libraryName) {
-      try {
-        context7Result = await context7.searchDocs(cleanQuery, libraryName);
-        statuses.push(providerStatus('Context7', Boolean(context7Result?.found), context7Result?.found ? 'docs found' : 'no docs found'));
-      } catch (error) {
-        statuses.push(providerStatus('Context7', false, error.message));
-      }
-    }
+  if (context7.hasContext7() && grokResult.ok && grokResult.detected_library) {
+    const attempt = await runProvider('Context7', () => context7.searchDocs(cleanQuery, grokResult.detected_library));
+    const value = attempt.value || {};
+    context7Result = attempt.ok
+      ? {
+          provider: 'Context7',
+          ok: true,
+          status: 'success',
+          elapsed_ms: attempt.elapsed_ms,
+          found: Boolean(value.found),
+          library: value.library || null,
+          docs: Array.isArray(value.docs) ? value.docs : [],
+          detail: value.found ? 'documentation found' : 'no documentation found',
+        }
+      : {
+          provider: 'Context7',
+          ok: false,
+          status: 'failed',
+          elapsed_ms: attempt.elapsed_ms,
+          found: false,
+          library: null,
+          docs: [],
+          detail: attempt.detail || 'Context7 request failed',
+        };
+    providerResults.context7 = context7Result;
+    statuses.push(providerStatusFromResult(context7Result));
   }
 
+  const legacySources = dedupeSources([
+    ...grokResult.sources,
+    ...tavilyResult.sources,
+  ]);
   const session = {
-    schema_version: 'x-search.session.v2',
-    session_id: `xsearch_${Date.now()}`,
+    schema_version: 'x-search.session.v3',
+    session_id: sessionId,
     query: cleanQuery,
-    queries,
-    provider,
+    queries: [cleanQuery],
+    provider: 'independent',
     provider_status: statuses,
-    answer: sanitize(answer) ? answer.trim() : fallbackAnswer(sources),
-    sources,
+    provider_results: providerResults,
+    // No top-level answer: the calling agent receives the independent
+    // provider results and decides how to compare or summarize them.
+    sources: legacySources,
     context7: context7Result,
+    search_timeout_ms: timeout,
     checked_at: new Date().toISOString(),
   };
 
-  cacheSession(session.session_id, session, cacheTtlDays(config));
-  printSearchResult(session, options.format || 'markdown');
-  if ((options.format || 'markdown') === 'markdown' && context7Result?.found) {
+  cacheSession(sessionId, session, ttlDays);
+  printSearchResult(session, format);
+  if (format === 'markdown' && context7Result?.found) {
     console.log(context7.formatDocsResult(context7Result));
   }
 }
@@ -207,22 +345,23 @@ async function cmdSearch(query, options) {
 async function cmdFetch(url, options) {
   const target = sanitize(url);
   if (!target) throw new Error('url is required');
-  new URL(target);
-
-  let content = '';
-  let method = 'direct HTTP fallback';
-  if (tavily.hasTavily()) {
-    try {
-      content = await tavily.extract(target);
-      if (content) method = 'Tavily extract';
-    } catch {}
+  const targetUrl = new URL(target);
+  if (!['http:', 'https:'].includes(targetUrl.protocol)) {
+    throw new Error(`Unsupported protocol: ${targetUrl.protocol}`);
   }
-  if (!content) content = await fallbackFetch(target, options.allow_private === true);
+  if (!tavily.hasTavily()) {
+    throw new Error('TAVILY_API_KEY not set; fetch requires Tavily');
+  }
+  // 私网/内网地址一律阻断：不把内网 URL 发送给第三方抽取服务，也没有本地抓取兜底。
+  await getSafeLookup(targetUrl, true);
 
-  const result = { url: target, method, checked_at: new Date().toISOString(), chars: content.length, content };
+  const content = await tavily.extract(targetUrl.href);
+  if (!content) throw new Error(`Tavily returned no content for ${target}`);
+
+  const result = { url: targetUrl.href, method: 'Tavily extract', checked_at: new Date().toISOString(), chars: content.length, content };
   if (options.format === 'json') console.log(JSON.stringify(result, null, 2));
-  else if (options.format === 'compact') console.log(`${method} | ${content.length} chars | ${target}`);
-  else console.log(`# x-search fetch\n\n- URL: ${target}\n- method: ${method}\n- checked_at: ${result.checked_at}\n- chars: ${content.length}\n\n## 正文\n\n${content}`);
+  else if (options.format === 'compact') console.log(`${result.method} | ${content.length} chars | ${target}`);
+  else console.log(`# x-search fetch\n\n- URL: ${target}\n- method: ${result.method}\n- checked_at: ${result.checked_at}\n- chars: ${content.length}\n\n## 正文\n\n${content}`);
 }
 
 async function cmdMap(url, options) {
@@ -314,14 +453,14 @@ function cmdCache(value) {
     if (!Number.isInteger(days) || days < 0) throw new Error('cache value must be a non-negative integer, or off');
     config.cache_ttl_days = days;
     saveConfig(config);
-    cleanupCache(days);
+    if (days === 0) cleanupCache(0);
   }
   const days = cacheTtlDays(config);
   console.log(days ? `cache = ${days} day(s)` : 'cache = off');
 }
 
 function cmdDoc() {
-  console.log(`x-search\n\nCommands:\n  search <query> [--plan off|auto|force] [--max-results N] [--max-queries N] [--model MODEL] [--format markdown|json|compact]\n  fetch <url> [--allow-private] [--format markdown|json|compact]\n  map <url> [--depth N] [--breadth N] [--limit N] [--format markdown|json|compact]\n  sources <session_id> [--format markdown|json|compact]\n  config [--format markdown|json|compact]\n  model [name]\n  cache [days|off]\n  doc`);
+  console.log(`x-search\n\nCommands:\n  search <query> [--max-results N] [--timeout-ms N] [--model MODEL] [--format markdown|json|compact]\n  fetch <url> [--format markdown|json|compact]\n  map <url> [--depth N] [--breadth N] [--limit N] [--format markdown|json|compact]\n  sources <session_id> [--format markdown|json|compact]\n  config [--format markdown|json|compact]\n  model [name]\n  cache [days|off]\n  doc\n\nSearch mode: Grok and Tavily run independently and return separate provider results.\nThe calling agent is responsible for comparison and synthesis.\n--timeout-ms applies independently to one request per provider (1000-120000); main search requests are not retried by the CLI.`);
 }
 
 function parseArgs(argv) {
@@ -332,12 +471,12 @@ function parseArgs(argv) {
     if (arg === '--plan') options.plan = argv[++i];
     else if (arg === '--max-results' || arg === '--max_results') options.max_results = Number(argv[++i]);
     else if (arg === '--max-queries' || arg === '--max_queries') options.max_queries = Number(argv[++i]);
+    else if (arg === '--timeout-ms' || arg === '--timeout_ms') options.timeout_ms = Number(argv[++i]);
     else if (arg === '--model' || arg === '-m') options.model = argv[++i];
     else if (arg === '--depth' || arg === '-d') options.depth = Number(argv[++i]);
     else if (arg === '--breadth' || arg === '-b') options.breadth = Number(argv[++i]);
     else if (arg === '--limit' || arg === '-l') options.limit = Number(argv[++i]);
     else if (arg === '--format') options.format = argv[++i];
-    else if (arg === '--allow-private') options.allow_private = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else options._args.push(arg);
   }

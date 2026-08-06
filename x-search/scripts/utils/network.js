@@ -80,14 +80,17 @@ function isPrivateAddress(address) {
   if (groups.slice(0, 7).every((group) => group === 0) && groups[7] === 1) return true;
   if ((groups[0] & 0xfe00) === 0xfc00) return true;
   if ((groups[0] & 0xffc0) === 0xfe80) return true;
+  if ((groups[0] & 0xffc0) === 0xfec0) return true;
   if ((groups[0] & 0xff00) === 0xff00) return true;
 
   const isIpv4Mapped = groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff;
   const isIpv4Compatible = groups.slice(0, 6).every((group) => group === 0);
-  if (isIpv4Mapped || isIpv4Compatible) {
+  if (isIpv4Mapped) {
     const ipv4 = `${groups[6] >> 8}.${groups[6] & 0xff}.${groups[7] >> 8}.${groups[7] & 0xff}`;
     return isPrivateIpv4(ipv4);
   }
+  if (isIpv4Compatible) return true;
+  if (groups[0] === 0x2001 && (groups[1] === 0x0002 || groups[1] === 0x0db8)) return true;
   return false;
 }
 
@@ -125,14 +128,17 @@ function isPrivateIpv4(address) {
     return true;
   }
 
-  const [a, b] = parts;
+  const [a, b, c] = parts;
   return a === 0 ||
     a === 10 ||
     a === 127 ||
     (a === 100 && b >= 64 && b <= 127) ||
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168);
+    (a === 192 && (b === 0 || b === 2 || (b === 88 && c === 99) || b === 168)) ||
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+    (a === 203 && b === 0 && c === 113) ||
+    a >= 224;
 }
 
 function stripIpv6Brackets(hostname) {
